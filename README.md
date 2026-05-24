@@ -1,2 +1,2 @@
-# Flipper-emu
+# FAP-emu
 Emu flipper apps without a flipper
