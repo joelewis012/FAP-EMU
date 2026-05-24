@@ -578,9 +578,18 @@ function App(){
       const{stubs,handlers}=buildStubs(displayRef.current,inputQueue,addLog);
       uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
         const h=handlers[addr];
-        if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e.message}`);ret=0;}if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);const lr=uc_h.reg_read(RP.LR)>>>0;uc_h.reg_write(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
+        if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e?.message??String(e)}`);ret=0;}if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);const lr=uc_h.reg_read(RP.LR)>>>0;uc_h.reg_write(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
         if((uc_h.reg_read(RP.PC)>>>0)===0xFEFEFEFE)uc_h.emu_stop();
       },STUB_BASE,STUB_BASE+0x100000);
+      /* Demand-paging hook: map any unmapped region on access so startup writes don't crash */
+      const MEM_INVALID=(window.uc.HOOK_MEM_READ_UNMAPPED??16)|(window.uc.HOOK_MEM_WRITE_UNMAPPED??32)|(window.uc.HOOK_MEM_FETCH_UNMAPPED??64);
+      let dynMaps=0;
+      try{uc.hook_add(MEM_INVALID,(uc_h,_type,addr)=>{
+        const page=(addr>>>0)&0xFFFF0000;
+        try{uc_h.mem_map(page,0x10000,7);}catch(e){}
+        if(dynMaps<16){addLog(`[MEM] dyn-map 64KB @ 0x${page.toString(16)} (access 0x${(addr>>>0).toString(16)})`);dynMaps++;}
+        return true;
+      },1,0xFFFFFFFF);}catch(e){addLog(`[MEM] hook unavailable: ${e?.message??String(e)}`);}
       const entry=loadFAP(uc,fap,stubs,addLog);
       addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
       try{uc.emu_start(entry,0xFEFEFEFE,0,2000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
