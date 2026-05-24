@@ -1,2 +1,2 @@
 # FAP-emu
-Emu flipper apps without a flipper
+Emulate flipper apps without a flipper. Gui only.
