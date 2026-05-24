@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Flipper EMU</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body {
+      margin: 0;
+      background: #06070f;
+      color: #e2e8f0;
+      font-family: 'Courier New', monospace;
+    }
+    button {
+      font-family: inherit;
+    }
+    canvas {
+      image-rendering: pixelated;
+    }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useCallback, useRef, useEffect } = React;
+const LCD_W = 128;
+const LCD_H = 64;
+const GB_ON = [15, 56, 15];
+const GB_OFF = [155, 188, 15];
+const InputKey = {
+  Up:0,
+  Down:1,
+  Left:2,
+  Right:3,
+  Ok:4,
+  Back:5
+};
+const InputType = {
+  Press:0,
+  Release:1
+};
+class FlipperDisplay {
+  constructor() {
+    this.px = new Uint8Array(LCD_W * LCD_H);
+    this.color = 1;
+  }
+  clear() {
+    this.px.fill(0);
+  }
+  dot(x, y) {
+    if (
+      x >= 0 &&
+      x < LCD_W &&
+      y >= 0 &&
+      y < LCD_H
+    ) {
+      this.px[y * LCD_W + x] = this.color;
+    }
+  }
+  box(x, y, w, h) {
+    for (let py = y; py < y + h; py++) {
+      for (let px = x; px < x + w; px++) {
+        this.dot(px, py);
+      }
+    }
+  }
+  render(canvas, scale) {
+    canvas.width = LCD_W * scale;
+    canvas.height = LCD_H * scale;
+    const ctx = canvas.getContext('2d');
+    const img = ctx.createImageData(
+      LCD_W * scale,
+      LCD_H * scale
+    );
+    for (let y = 0; y < LCD_H; y++) {
+      for (let x = 0; x < LCD_W; x++) {
+        const on = this.px[y * LCD_W + x];
+        const [r,g,b] = on
+          ? GB_ON
+          : GB_OFF;
+        for (let sy = 0; sy < scale; sy++) {
+          for (let sx = 0; sx < scale; sx++) {
+            const i =
+              (
+                (y * scale + sy) *
+                (LCD_W * scale) +
+                (x * scale + sx)
+              ) * 4;
+            img.data[i] = r;
+            img.data[i + 1] = g;
+            img.data[i + 2] = b;
+            img.data[i + 3] = 255;
+          }
+        }
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+}
+function useWindowWidth() {
+  const [w, setW] = useState(window.innerWidth);
+  useEffect(() => {
+    const h = () => setW(window.innerWidth);
+    window.addEventListener('resize', h);
+    return () => {
+      window.removeEventListener('resize', h);
+    };
+  }, []);
+  return w;
+}
+function FlipperScreen({ canvasRef, scale }) {
+  return (
+    <div
+      style={{
+        background:'#1a1a2e',
+        padding:'6px',
+        borderRadius:4,
+        border:'2px solid #252545',
+        boxShadow:'0 0 24px rgba(155,188,15,0.2)'
+      }}
+    >
+      <canvas
+        ref={canvasRef}
+        width={LCD_W * scale}
+        height={LCD_H * scale}
+      />
+    </div>
+  );
+}
+function DPad({ onInput }) {
+  const D = 42;
+  const btnStyle = {
+    background:'rgba(255,255,255,0.06)',
+    border:'1px solid rgba(255,255,255,0.1)',
+    color:'rgba(255,255,255,0.65)',
+    borderRadius:4,
+    cursor:'pointer',
+    width:D,
+    height:D
+  };
+  const btn = (label, key) => (
+    <button
+      onPointerDown={() => onInput(key, InputType.Press)}
+      onPointerUp={() => onInput(key, InputType.Release)}
+      style={btnStyle}
+    >
+      {label}
+    </button>
+  );
+  return (
+    <div
+      style={{
+        display:'grid',
+        gridTemplateColumns:`${D}px ${D}px ${D}px`,
+        gap:4
+      }}
+    >
+      <span></span>
+      {btn('▲', InputKey.Up)}
+      <span></span>
+      {btn('◀', InputKey.Left)}
+      {btn('OK', InputKey.Ok)}
+      {btn('▶', InputKey.Right)}
+      <span></span>
+      {btn('▼', InputKey.Down)}
+      <span></span>
+    </div>
+  );
+}
+function App() {
+  const canvasRef = useRef();
+  const displayRef = useRef(
+    new FlipperDisplay()
+  );
+  const [logs, setLogs] = useState([]);
+  const winW = useWindowWidth();
+  const mobile = winW < 600;
+  const scale = mobile ? 3 : 4;
+  const addLog = useCallback((msg) => {
+    setLogs(l => [...l, msg]);
+  }, []);
+  const renderDisplay = useCallback(() => {
+    if (canvasRef.current) {
+      displayRef.current.render(
+        canvasRef.current,
+        scale
+      );
+    }
+  }, [scale]);
+  useEffect(() => {
+    const d = displayRef.current;
+    d.clear();
+    d.box(10, 10, 40, 20);
+    d.box(70, 20, 30, 15);
+    renderDisplay();
+  }, [renderDisplay]);
+  const onDpad = (key, type) => {
+    addLog(
+      `Input: ${
+        Object.keys(InputKey)[key]
+      } ${
+        type === 0
+          ? 'DOWN'
+          : 'UP'
+      }`
+    );
+  };
+  return (
+    <div style={{padding:20}}>
+      <div
+        style={{
+          display:'flex',
+          alignItems:'center',
+          gap:10,
+          marginBottom:20
+        }}
+      >
+        <div
+          style={{
+            fontWeight:'bold',
+            fontSize:18
+          }}
+        >
+          <span style={{color:'#ff9900'}}>
+            FLIPPER
+          </span>
+          {' '}
+          EMU
+        </div>
+      </div>
+      <div
+        style={{
+          display:'flex',
+          gap:20,
+          flexWrap:'wrap'
+        }}
+      >
+        <div>
+          <FlipperScreen
+            canvasRef={canvasRef}
+            scale={scale}
+          />
+          <div style={{marginTop:20}}>
+            <DPad onInput={onDpad} />
+          </div>
+        </div>
+        <div
+          style={{
+            flex:1,
+            minWidth:250,
+            background:'rgba(255,255,255,0.03)',
+            border:'1px solid rgba(255,255,255,0.08)',
+            borderRadius:6,
+            padding:12
+          }}
+        >
+          <div
+            style={{
+              marginBottom:10,
+              color:'#ff9900',
+              fontSize:12
+            }}
+          >
+            LOG OUTPUT
+          </div>
+          <div
+            style={{
+              height:300,
+              overflowY:'auto',
+              fontSize:12,
+              lineHeight:1.7
+            }}
+          >
+            {logs.map((l, i) => (
+              <div key={i}>{l}</div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+ReactDOM
+  .createRoot(
+    document.getElementById('root')
+  )
+  .render(<App />);
+</script>
+</body>
+</html>
