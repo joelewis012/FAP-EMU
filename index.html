@@ -519,15 +519,28 @@ function App(){
 
   const runFAP=useCallback(async()=>{
     if(!fap||!ucReady||!window.uc){addLog('[ERR] Unicorn.js not ready');return;}
+    if(fap.imports.length===0&&!fap.isDyn){
+      addLog('[ERR] Static binary — no imports to stub.');
+      addLog('[ERR] FAP EMU requires a dynamically-linked .fap. This binary has no SDK imports and cannot be emulated.');
+      setError('Static binary with 0 imports — FAP EMU only supports dynamically-linked .fap files that import Flipper SDK symbols.');
+      return;
+    }
     setEmuState('running');emuStateRef.current='running';
     setLogs([]);displayRef.current.clear();renderDisplay();
+    let commitSeen=false;
+    const watchdog=setTimeout(()=>{
+      if(emuStateRef.current==='running'&&!commitSeen){
+        addLog('[WARN] Watchdog: no canvas_commit after 5s — app may be stuck or incompatible.');
+        addLog('[WARN] Try pressing OK or UP to trigger a draw callback.');
+      }
+    },5000);
     try{
       const uc=new window.uc.Unicorn(window.uc.ARCH_ARM,window.uc.MODE_THUMB);
       ucRef.current=uc;
       const{stubs,handlers}=buildStubs(displayRef.current,inputQueue,addLog);
       uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
         const h=handlers[addr];
-        if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e.message}`);ret=0;}if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);const lr=uc_h.reg_read(RP.LR)>>>0;uc_h.reg_write(RP.PC,lr&~1);if(addr===stubs['canvas_commit'])renderDisplay();}
+        if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e.message}`);ret=0;}if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);const lr=uc_h.reg_read(RP.LR)>>>0;uc_h.reg_write(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
         if((uc_h.reg_read(RP.PC)>>>0)===0xFEFEFEFE)uc_h.emu_stop();
       },STUB_BASE,STUB_BASE+0x100000);
       const entry=loadFAP(uc,fap,stubs,addLog);
@@ -535,12 +548,12 @@ function App(){
       try{uc.emu_start(entry,0xFEFEFEFE,0,2000000);}catch(e){addLog(`[EMU] init: ${e.message}`);}
       renderDisplay();
       const tick=()=>{
-        if(emuStateRef.current!=='running'){loopRef.current=null;return;}
+        if(emuStateRef.current!=='running'){clearTimeout(watchdog);loopRef.current=null;return;}
         try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,5000);renderDisplay();}catch(e){}
         loopRef.current=requestAnimationFrame(tick);
       };
       loopRef.current=requestAnimationFrame(tick);
-    }catch(e){addLog(`[ERR] ${e.message}`);setEmuState('error');emuStateRef.current='error';}
+    }catch(e){clearTimeout(watchdog);addLog(`[ERR] ${e.message}`);setEmuState('error');emuStateRef.current='error';}
   },[fap,ucReady,addLog,renderDisplay]);
 
   const stopFAP=()=>{
