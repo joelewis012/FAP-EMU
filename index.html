@@ -497,7 +497,7 @@ function App(){
   useEffect(()=>{
     if(window.uc){setUcReady(true);return;}
     const try2=(url,fb)=>{const s=document.createElement('script');s.src=url;s.onload=()=>{setUcReady(true);addLog('[EMU] Unicorn.js loaded ✓');};s.onerror=()=>{if(fb)fb();else setUcErr('Unicorn.js unavailable. Download unicorn.js from github.com/AlexAltea/unicorn.js and add a <script src="unicorn.js"> tag.');};document.head.appendChild(s);};
-    try2('https://cdn.jsdelivr.net/npm/unicorn.js/unicorn.js',()=>try2('https://unpkg.com/unicorn.js/unicorn.js',null));
+    try2('unicorn.js',()=>try2('https://cdn.jsdelivr.net/npm/unicorn.js/unicorn.js',()=>try2('https://unpkg.com/unicorn.js/unicorn.js',null)));
   },[addLog]);
 
   /* Keyboard */
