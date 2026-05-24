@@ -363,8 +363,13 @@ function loadFAP(uc,fap,stubs,log){
   const rs=(o,max=64)=>{let s='';for(let i=0;i<max;i++){const c=u8[o+i];if(!c)break;s+=String.fromCharCode(c);}return s;};
   const w32=(addr,val)=>{const b=new Uint8Array(4);new DataView(b.buffer).setUint32(0,val,le);uc.mem_write(addr,b);};
   uc.mem_map(LOAD_BASE,4*1024*1024,7);uc.mem_map(RAM_BASE,1*1024*1024,6);uc.mem_map(STUB_BASE,1*1024*1024,7);
-  /* Map a null page so unresolved calls to address 0 return gracefully */
-  try{uc.mem_map(0,4096,5);const nop=new Uint8Array(4096);for(let i=0;i<2048;i++){nop[i*2]=0x70;nop[i*2+1]=0x47;}uc.mem_write(0,nop);}catch(e){}
+  /* Peripheral space for hardware register writes (no exec) */
+  try{uc.mem_map(STUB_BASE+0x100000,7*1024*1024,6);}catch(e){}  // 0x40100000-0x40800000
+  try{uc.mem_map(0xE0000000,0x10000,6);}catch(e){}              // ARM system control
+  /* Null page — unresolved calls land here and return */
+  try{uc.mem_map(0,0x10000,5);const np=new Uint8Array(0x10000);for(let i=0;i<0x8000;i++){np[i*2]=0x70;np[i*2+1]=0x47;}uc.mem_write(0,np);}catch(e){}
+  /* EXC_RETURN zone (0xFFFF0000) — Cortex-M exception returns land here */
+  try{uc.mem_map(0xFFFF0000,0x10000,5);const er=new Uint8Array(0x10000);for(let i=0;i<0x8000;i++){er[i*2]=0x70;er[i*2+1]=0x47;}uc.mem_write(0xFFFF0000,er);}catch(e){}
   const sc=new Uint8Array(1024*4);for(let i=0;i<1024;i++){sc[i*4]=0x70;sc[i*4+1]=0x47;}uc.mem_write(STUB_BASE,sc);
   const sec=n=>fap.rawSections.find(s=>s.name===n);
   const hasPhdrs=fap.phdrs&&fap.phdrs.some(p=>p.type===1);
@@ -581,12 +586,18 @@ function App(){
         if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e?.message??String(e)}`);ret=0;}if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);const lr=uc_h.reg_read(RP.LR)>>>0;uc_h.reg_write(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
         if((uc_h.reg_read(RP.PC)>>>0)===0xFEFEFEFE)uc_h.emu_stop();
       },STUB_BASE,STUB_BASE+0x100000);
+      /* EXC_RETURN hook — intercept Cortex-M exception returns (0xFFFFFFF*) and stop cleanly */
+      try{uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{uc_h.emu_stop();addLog('[EMU] EXC_RETURN — app exited via exception return');},0xFFFF0000,0xFFFFFFFF);}catch(e){}
       /* Demand-paging hook: map any unmapped region on access so startup writes don't crash */
       const MEM_INVALID=(window.uc.HOOK_MEM_READ_UNMAPPED??16)|(window.uc.HOOK_MEM_WRITE_UNMAPPED??32)|(window.uc.HOOK_MEM_FETCH_UNMAPPED??64);
       let dynMaps=0;
       try{uc.hook_add(MEM_INVALID,(uc_h,_type,addr)=>{
-        const page=(addr>>>0)&0xFFFF0000;
-        try{uc_h.mem_map(page,0x10000,7);}catch(e){}
+        const page=((addr>>>0)&0xFFFF0000)>>>0;  // unsigned page-align
+        try{
+          uc_h.mem_map(page,0x10000,7);
+          const fill=new Uint8Array(0x10000);for(let i=0;i<0x8000;i++){fill[i*2]=0x70;fill[i*2+1]=0x47;}
+          uc_h.mem_write(page,fill);
+        }catch(e){}
         if(dynMaps<16){addLog(`[MEM] dyn-map 64KB @ 0x${page.toString(16)} (access 0x${(addr>>>0).toString(16)})`);dynMaps++;}
         return true;
       },1,0xFFFFFFFF);}catch(e){addLog(`[MEM] hook unavailable: ${e?.message??String(e)}`);}
