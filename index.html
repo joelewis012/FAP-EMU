@@ -1,293 +1,670 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Flipper EMU</title>
-  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <style>
-    body {
-      margin: 0;
-      background: #06070f;
-      color: #e2e8f0;
-      font-family: 'Courier New', monospace;
-    }
-    button {
-      font-family: inherit;
-    }
-    canvas {
-      image-rendering: pixelated;
-    }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>FAP EMU — Flipper-compatible App Emulator</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.development.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.22.15/babel.min.js"></script>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{background:#06070f;color:#e2e8f0;font-family:'Courier New',monospace;-webkit-text-size-adjust:100%;}
+  ::-webkit-scrollbar{width:4px;} ::-webkit-scrollbar-track{background:rgba(255,255,255,0.03);}
+  ::-webkit-scrollbar-thumb{background:rgba(255,140,0,0.3);border-radius:2px;}
+  button:active{opacity:0.7;} input[type=file]{display:none;}
+</style>
 </head>
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const { useState, useCallback, useRef, useEffect } = React;
-const LCD_W = 128;
-const LCD_H = 64;
-const GB_ON = [15, 56, 15];
-const GB_OFF = [155, 188, 15];
-const InputKey = {
-  Up:0,
-  Down:1,
-  Left:2,
-  Right:3,
-  Ok:4,
-  Back:5
-};
-const InputType = {
-  Press:0,
-  Release:1
-};
-class FlipperDisplay {
-  constructor() {
-    this.px = new Uint8Array(LCD_W * LCD_H);
-    this.color = 1;
+const{useState,useCallback,useRef,useEffect}=React;
+
+/* ── Constants ─────────────────────────────────────────────────────────── */
+const LCD_W=128,LCD_H=64;
+const GB_ON=[15,56,15],GB_OFF=[155,188,15];
+const LOAD_BASE=0x08000000,RAM_BASE=0x20000000;
+const HEAP_BASE=0x20010000,STACK_TOP=0x20030000,STUB_BASE=0x40000000;
+const RP={R0:66,R1:67,R2:68,R3:69,SP:71,LR:72,PC:73};
+const EM_ARM=40,SHN_UNDEF=0;
+const InputKey={Up:0,Down:1,Left:2,Right:3,Ok:4,Back:5};
+const InputType={Press:0,Release:1,Short:2};
+const KEY_MAP={ArrowUp:0,ArrowDown:1,ArrowLeft:2,ArrowRight:3,Enter:4,Backspace:5,Escape:5};
+
+/* ── API Categories (Phase 3: added ViewDispatcher / Scene / Widgets) ─── */
+const CATS=[
+  {key:"canvas",  label:"Canvas / Display",    status:"STUBBABLE",color:"#22c55e",bg:"#052e16",px:["canvas_"]},
+  {key:"viewport",label:"ViewPort",             status:"STUBBABLE",color:"#22c55e",bg:"#052e16",px:["view_port_"]},
+  {key:"vd",      label:"ViewDispatcher",       status:"STUBBABLE",color:"#22c55e",bg:"#052e16",px:["view_dispatcher_"]},
+  {key:"view",    label:"View",                 status:"STUBBABLE",color:"#22c55e",bg:"#052e16",px:["view_alloc","view_free","view_set_","view_get_","view_commit_"]},
+  {key:"scene",   label:"SceneManager",         status:"STUBBABLE",color:"#22c55e",bg:"#052e16",px:["scene_manager_"]},
+  {key:"widgets", label:"UI Widgets",           status:"STUBBABLE",color:"#22c55e",bg:"#052e16",px:["submenu_","popup_","text_box_","text_input_","dialog_ex_","variable_item","loading_","menu_"]},
+  {key:"gui",     label:"GUI",                  status:"STUBBABLE",color:"#22c55e",bg:"#052e16",px:["gui_"]},
+  {key:"memory",  label:"Memory / libc",        status:"STUBBABLE",color:"#22c55e",bg:"#052e16",px:["malloc","free","realloc","calloc","memcpy","memset","memmove","memcmp","strlen","strcpy","strncpy","strcmp","strncmp","strcat","sprintf","snprintf","printf","furi_alloc","furi_free"]},
+  {key:"timer",   label:"Timer / Delay",        status:"STUBBABLE",color:"#22c55e",bg:"#052e16",px:["furi_timer_","furi_delay_","furi_get_tick","furi_hal_delay"]},
+  {key:"notify",  label:"Notifications",        status:"STUBBABLE",color:"#22c55e",bg:"#052e16",px:["notification_"]},
+  {key:"sync",    label:"Mutex / Semaphore",    status:"PARTIAL",  color:"#eab308",bg:"#1c1a05",px:["furi_mutex_","furi_semaphore_","furi_event_flag_"]},
+  {key:"queue",   label:"Message Queue",        status:"PARTIAL",  color:"#eab308",bg:"#1c1a05",px:["furi_message_queue_"]},
+  {key:"thread",  label:"Threads",              status:"PARTIAL",  color:"#eab308",bg:"#1c1a05",px:["furi_thread_"]},
+  {key:"storage", label:"Storage / FS",        status:"STUB",     color:"#f97316",bg:"#1c0a00",px:["storage_","filesystem_","furi_hal_flash"]},
+  {key:"subghz",  label:"SubGHz — NO-OP",      status:"HARDWARE", color:"#ef4444",bg:"#1c0505",px:["subghz_","furi_hal_subghz"]},
+  {key:"ir",      label:"Infrared — NO-OP",    status:"HARDWARE", color:"#ef4444",bg:"#1c0505",px:["infrared_","furi_hal_infrared","ir_worker"]},
+  {key:"nfc",     label:"NFC — NO-OP",         status:"HARDWARE", color:"#ef4444",bg:"#1c0505",px:["nfc_","furi_hal_nfc","mf_"]},
+  {key:"rfid",    label:"RFID — NO-OP",        status:"HARDWARE", color:"#ef4444",bg:"#1c0505",px:["rfid_","lfrfid_","furi_hal_rfid"]},
+  {key:"bt",      label:"Bluetooth — NO-OP",   status:"HARDWARE", color:"#ef4444",bg:"#1c0505",px:["bt_","furi_hal_bt"]},
+  {key:"gpio",    label:"GPIO / SPI — NO-OP",  status:"HARDWARE", color:"#ef4444",bg:"#1c0505",px:["gpio_","furi_hal_gpio","furi_hal_spi","furi_hal_uart"]},
+  {key:"usb",     label:"USB — NO-OP",         status:"HARDWARE", color:"#ef4444",bg:"#1c0505",px:["usb_","furi_hal_usb"]},
+];
+function categorize(n){for(const c of CATS)if(c.px.some(p=>n===p||n.startsWith(p)))return c;return{key:"unknown",label:"Unknown",status:"UNKNOWN",color:"#6b7280",bg:"#111",px:[]};}
+
+/* ── ELF Parser ────────────────────────────────────────────────────────── */
+function parseELF(buffer){
+  const view=new DataView(buffer),u8=new Uint8Array(buffer);
+  if(view.getUint32(0,false)!==0x7f454c46)throw new Error("Not a valid ELF file");
+  if(u8[4]!==1)throw new Error("Only 32-bit ELF supported");
+  const le=u8[5]===1;
+  const eMachine=view.getUint16(18,le),eEntry=view.getUint32(24,le);
+  const eShoff=view.getUint32(32,le),eSz=view.getUint16(46,le);
+  const eShnum=view.getUint16(48,le),eShstrndx=view.getUint16(50,le);
+  if(eMachine!==EM_ARM)throw new Error("Not an ARM binary — is this a .fap?");
+  const rs=(o,max=256)=>{let s='';for(let i=0;i<max;i++){const c=u8[o+i];if(!c)break;s+=String.fromCharCode(c);}return s;};
+  const shdrs=[];
+  for(let i=0;i<eShnum;i++){const o=eShoff+i*eSz;shdrs.push({nameIdx:view.getUint32(o,le),type:view.getUint32(o+4,le),flags:view.getUint32(o+8,le),addr:view.getUint32(o+12,le),offset:view.getUint32(o+16,le),size:view.getUint32(o+20,le),link:view.getUint32(o+24,le),info:view.getUint32(o+28,le),entsize:view.getUint32(o+36,le)});}
+  const ss=shdrs[eShstrndx];shdrs.forEach(s=>{s.name=rs(ss.offset+s.nameIdx);});
+  const dynsym=shdrs.find(s=>s.name==='.dynsym'),dynstr=shdrs.find(s=>s.name==='.dynstr');
+  const imports=[];
+  if(dynsym&&dynstr){const ent=dynsym.entsize||16,cnt=Math.floor(dynsym.size/ent);for(let i=1;i<cnt;i++){const o=dynsym.offset+i*ent,ni=view.getUint32(o,le),val=view.getUint32(o+4,le),info=u8[o+12],shndx=view.getUint16(o+14,le),name=rs(dynstr.offset+ni);if(shndx===SHN_UNDEF&&name.length>0)imports.push({name,value:val,binding:info>>4,type:info&0xf});}}
+  const rodata=shdrs.find(s=>s.name==='.rodata');
+  const strings=[];if(rodata){let cur='';for(let i=0;i<rodata.size;i++){const c=u8[rodata.offset+i];if(c===0&&cur.length>=3){strings.push(cur);cur='';}else if(c>=32&&c<127)cur+=String.fromCharCode(c);else cur='';}}
+  const appId=strings.find(s=>/^[a-z][a-z0-9_]{2,24}$/.test(s)&&!['text','data','bss','got','plt'].includes(s));
+  const appName=strings.find(s=>/^[A-Z][A-Za-z0-9 \-_]{2,30}$/.test(s)&&s!==appId);
+  const relSections=shdrs.filter(s=>s.name.startsWith('.rel'));
+  const sections=shdrs.filter(s=>s.name&&s.name.length>0&&s.size>0);
+  return{fileName:'',fileSize:buffer.byteLength,buffer,eEntry,isDyn:view.getUint16(16,le)===3,sections,rawSections:shdrs,imports,relSections,appId,appName,textSize:sections.find(s=>s.name==='.text')?.size??0,rodataSize:rodata?.size??0,bssSize:sections.find(s=>s.name==='.bss')?.size??0,dataSize:sections.find(s=>s.name==='.data')?.size??0};
+}
+
+/* ── Display (Phase 3: icon rendering from XBM bitmap in memory) ──────── */
+class FlipperDisplay{
+  constructor(){this.px=new Uint8Array(LCD_W*LCD_H);this.color=1;this.font='primary';}
+  clear(){this.px.fill(0);}
+  setColor(c){this.color=c?1:0;}
+  invertColor(){this.color^=1;}
+  dot(x,y){x=x|0;y=y|0;if(x>=0&&x<LCD_W&&y>=0&&y<LCD_H)this.px[y*LCD_W+x]=this.color;}
+  line(x0,y0,x1,y1){x0=x0|0;y0=y0|0;x1=x1|0;y1=y1|0;const dx=Math.abs(x1-x0),dy=Math.abs(y1-y0),sx=x0<x1?1:-1,sy=y0<y1?1:-1;let err=dx-dy;for(;;){this.dot(x0,y0);if(x0===x1&&y0===y1)break;const e2=2*err;if(e2>-dy){err-=dy;x0+=sx;}if(e2<dx){err+=dx;y0+=sy;}}}
+  box(x,y,w,h){for(let py=y|0;py<(y+h)|0;py++)for(let px=x|0;px<(x+w)|0;px++)this.dot(px,py);}
+  frame(x,y,w,h){this.line(x,y,x+w-1,y);this.line(x,y+h-1,x+w-1,y+h-1);this.line(x,y,x,y+h-1);this.line(x+w-1,y,x+w-1,y+h-1);}
+  rbox(x,y,w,h,r){this._r(x,y,w,h,r,true);}
+  rframe(x,y,w,h,r){this._r(x,y,w,h,r,false);}
+  _r(x,y,w,h,r,fill){r=Math.min(r,Math.floor(w/2),Math.floor(h/2));if(fill){this.box(x+r,y,w-2*r,h);this.box(x,y+r,r,h-2*r);this.box(x+w-r,y+r,r,h-2*r);}else{this.line(x+r,y,x+w-r-1,y);this.line(x+r,y+h-1,x+w-r-1,y+h-1);this.line(x,y+r,x,y+h-r-1);this.line(x+w-1,y+r,x+w-1,y+h-r-1);}for(let cy=0;cy<r;cy++)for(let cx=0;cx<r;cx++){if((cx+.5)*(cx+.5)+(cy+.5)*(cy+.5)<=r*r){if(fill||cx===0||cy===0){this.dot(x+r-1-cx,y+r-1-cy);this.dot(x+w-r+cx,y+r-1-cy);this.dot(x+r-1-cx,y+h-r+cy);this.dot(x+w-r+cx,y+h-r+cy);}}}}
+  circle(cx,cy,r){let x=r,y=0,err=0;while(x>=y){[[cx+x,cy+y],[cx+y,cy+x],[cx-y,cy+x],[cx-x,cy+y],[cx-x,cy-y],[cx-y,cy-x],[cx+y,cy-x],[cx+x,cy-y]].forEach(([a,b])=>this.dot(a,b));if(err<=0){y++;err+=2*y+1;}if(err>0){x--;err-=2*x+1;}}}
+  disc(cx,cy,r){for(let y=-r;y<=r;y++)for(let x=-r;x<=r;x++)if(x*x+y*y<=r*r)this.dot(cx+x,cy+y);}
+  /* Phase 3: improved font using tuned canvas sizes */
+  str(x,y,text,font){
+    if(!text)return;
+    const sz=font==='secondary'?6:font==='keyboard'?11:font==='bignumbers'?20:8;
+    try{const tmp=document.createElement('canvas');tmp.width=Math.max(4,text.length*(sz+2));tmp.height=sz+4;const ctx=tmp.getContext('2d');ctx.font=`${sz}px monospace`;ctx.fillStyle='white';ctx.fillText(text,0,sz);const d=ctx.getImageData(0,0,tmp.width,tmp.height).data;for(let py=0;py<tmp.height;py++)for(let px=0;px<tmp.width;px++)if(d[(py*tmp.width+px)*4+3]>64)this.dot(x+px,y+py);}catch(e){}
   }
-  clear() {
-    this.px.fill(0);
+  /* Phase 3: XBM icon rendering — parse Icon struct from emulator memory */
+  drawIcon(uc,x,y,iconPtr){
+    if(!uc||!iconPtr)return;
+    try{
+      const hdr=uc.mem_read(iconPtr,8);
+      const w=hdr[0],h=hdr[1];
+      if(w===0||h===0||w>128||h>64)return;
+      /* frames** pointer at offset 4 */
+      const fArrPtr=(hdr[4])|(hdr[5]<<8)|(hdr[6]<<16)|(hdr[7]<<24);
+      if(!fArrPtr)return;
+      const fpb=uc.mem_read(fArrPtr,4);
+      const framePtr=(fpb[0])|(fpb[1]<<8)|(fpb[2]<<16)|(fpb[3]<<24);
+      if(!framePtr)return;
+      const bpr=Math.ceil(w/8);
+      const data=uc.mem_read(framePtr,bpr*h);
+      for(let row=0;row<h;row++)
+        for(let col=0;col<w;col++)
+          if(data[row*bpr+Math.floor(col/8)]&(1<<(col%8)))this.dot(x+col,y+row);
+    }catch(e){}
   }
-  dot(x, y) {
-    if (
-      x >= 0 &&
-      x < LCD_W &&
-      y >= 0 &&
-      y < LCD_H
-    ) {
-      this.px[y * LCD_W + x] = this.color;
-    }
-  }
-  box(x, y, w, h) {
-    for (let py = y; py < y + h; py++) {
-      for (let px = x; px < x + w; px++) {
-        this.dot(px, py);
-      }
-    }
-  }
-  render(canvas, scale) {
-    canvas.width = LCD_W * scale;
-    canvas.height = LCD_H * scale;
-    const ctx = canvas.getContext('2d');
-    const img = ctx.createImageData(
-      LCD_W * scale,
-      LCD_H * scale
-    );
-    for (let y = 0; y < LCD_H; y++) {
-      for (let x = 0; x < LCD_W; x++) {
-        const on = this.px[y * LCD_W + x];
-        const [r,g,b] = on
-          ? GB_ON
-          : GB_OFF;
-        for (let sy = 0; sy < scale; sy++) {
-          for (let sx = 0; sx < scale; sx++) {
-            const i =
-              (
-                (y * scale + sy) *
-                (LCD_W * scale) +
-                (x * scale + sx)
-              ) * 4;
-            img.data[i] = r;
-            img.data[i + 1] = g;
-            img.data[i + 2] = b;
-            img.data[i + 3] = 255;
-          }
-        }
-      }
-    }
-    ctx.putImageData(img, 0, 0);
+  render(canvas,scale){
+    canvas.width=LCD_W*scale;canvas.height=LCD_H*scale;
+    const ctx=canvas.getContext('2d'),img=ctx.createImageData(LCD_W*scale,LCD_H*scale);
+    for(let y=0;y<LCD_H;y++)for(let x=0;x<LCD_W;x++){const on=this.px[y*LCD_W+x];const[r,g,b]=on?GB_ON:GB_OFF;for(let sy=0;sy<scale;sy++)for(let sx=0;sx<scale;sx++){const i=((y*scale+sy)*(LCD_W*scale)+(x*scale+sx))*4;img.data[i]=r;img.data[i+1]=g;img.data[i+2]=b;img.data[i+3]=255;}}
+    ctx.putImageData(img,0,0);
   }
 }
-function useWindowWidth() {
-  const [w, setW] = useState(window.innerWidth);
-  useEffect(() => {
-    const h = () => setW(window.innerWidth);
-    window.addEventListener('resize', h);
-    return () => {
-      window.removeEventListener('resize', h);
-    };
-  }, []);
-  return w;
+
+/* ── Stubs (Phase 3: ViewDispatcher, View, SceneManager, Widgets) ──────── */
+function buildStubs(display,inputQueueRef,logFn){
+  const stubs={},handlers={};let nextAddr=STUB_BASE;
+  const log=logFn||(()=>{});
+  function reg(name,fn){stubs[name]=nextAddr;handlers[nextAddr]=fn;nextAddr+=4;}
+  const d=display;let heap=HEAP_BASE;
+  const rr=(uc,n)=>(uc.reg_read(RP.R0+n))>>>0;
+  const spa=(uc,n)=>{const s=(uc.reg_read(RP.SP))>>>0;const b=uc.mem_read(s+n*4,4);return(b[0]|(b[1]<<8)|(b[2]<<16)|(b[3]<<24))>>>0;};
+  const rs=(uc,addr)=>{if(!addr)return'';let s='';try{for(let i=0;i<256;i++){const b=uc.mem_read(addr+i,1)[0];if(!b)break;s+=String.fromCharCode(b);}}catch(e){}return s;};
+  const mm=(uc,sz)=>{if(!sz)return 0;const a=heap;heap+=(sz+7)&~7;try{if(uc)uc.mem_write(a,new Uint8Array(sz));}catch(e){}return a;};
+  const w32=(uc,addr,val)=>{const b=new Uint8Array(4);new DataView(b.buffer).setUint32(0,val,true);try{uc.mem_write(addr,b);}catch(e){}};
+
+  /* Canvas */
+  reg('canvas_clear',            ()=>d.clear());
+  reg('canvas_commit',           ()=>{});
+  reg('canvas_set_color',        (uc)=>d.setColor(rr(uc,1)));
+  reg('canvas_invert_color',     ()=>d.invertColor());
+  reg('canvas_set_font',         (uc)=>{const f=['primary','secondary','keyboard','bignumbers'];d.font=f[rr(uc,1)]||'primary';});
+  reg('canvas_width',            ()=>128);
+  reg('canvas_height',           ()=>64);
+  reg('canvas_draw_dot',         (uc)=>d.dot(rr(uc,1),rr(uc,2)));
+  reg('canvas_draw_line',        (uc)=>d.line(rr(uc,1),rr(uc,2),rr(uc,3),spa(uc,0)));
+  reg('canvas_draw_box',         (uc)=>d.box(rr(uc,1),rr(uc,2),rr(uc,3),spa(uc,0)));
+  reg('canvas_draw_frame',       (uc)=>d.frame(rr(uc,1),rr(uc,2),rr(uc,3),spa(uc,0)));
+  reg('canvas_draw_rbox',        (uc)=>d.rbox(rr(uc,1),rr(uc,2),rr(uc,3),spa(uc,0),spa(uc,1)));
+  reg('canvas_draw_rframe',      (uc)=>d.rframe(rr(uc,1),rr(uc,2),rr(uc,3),spa(uc,0),spa(uc,1)));
+  reg('canvas_draw_circle',      (uc)=>d.circle(rr(uc,1),rr(uc,2),rr(uc,3)));
+  reg('canvas_draw_disc',        (uc)=>d.disc(rr(uc,1),rr(uc,2),rr(uc,3)));
+  reg('canvas_draw_str',         (uc)=>d.str(rr(uc,1),rr(uc,2),rs(uc,rr(uc,3)),d.font));
+  reg('canvas_draw_str_aligned', (uc)=>d.str(rr(uc,1),rr(uc,2),rs(uc,spa(uc,1)),d.font));
+  /* Phase 3: icon rendering */
+  reg('canvas_draw_icon',        (uc)=>d.drawIcon(uc,rr(uc,1),rr(uc,2),rr(uc,3)));
+  reg('canvas_draw_bitmap',      ()=>{});
+  reg('canvas_get_font_params',  ()=>{});
+
+  /* ViewPort */
+  let vpDraw=0,vpInput=0,vpCtx=0;
+  reg('view_port_alloc',              (uc)=>mm(uc,64));
+  reg('view_port_free',               ()=>{});
+  reg('view_port_enabled_set',        ()=>{});
+  reg('view_port_draw_callback_set',  (uc)=>{vpDraw=rr(uc,1);vpCtx=rr(uc,2);log(`[VP] draw_cb=0x${rr(uc,1).toString(16)}`);});
+  reg('view_port_input_callback_set', (uc)=>{vpInput=rr(uc,1);log(`[VP] input_cb=0x${rr(uc,1).toString(16)}`);});
+  reg('view_port_update',             ()=>{});
+  stubs._getVPDraw=()=>vpDraw;stubs._getVPInput=()=>vpInput;stubs._getVPCtx=()=>vpCtx;
+
+  /* GUI */
+  reg('gui_add_view_port',         ()=>log('[GUI] viewport added'));
+  reg('gui_remove_view_port',      ()=>{});
+  reg('gui_get_framebuffer_size',  ()=>1024);
+
+  /* Phase 3: ViewDispatcher */
+  let vdCtx=0,vdCustomCb=0,vdNavCb=0;
+  reg('view_dispatcher_alloc',                        (uc)=>mm(uc,128));
+  reg('view_dispatcher_free',                         ()=>{});
+  reg('view_dispatcher_enable_queue',                 ()=>{});
+  reg('view_dispatcher_attach_to_gui',                ()=>log('[VD] attached to GUI'));
+  reg('view_dispatcher_run',                          ()=>log('[VD] run() — event loop started'));
+  reg('view_dispatcher_stop',                         ()=>{});
+  reg('view_dispatcher_add_view',                     ()=>{});
+  reg('view_dispatcher_remove_view',                  ()=>{});
+  reg('view_dispatcher_switch_to_view',               (uc)=>log(`[VD] switch_to_view(${rr(uc,1)})`));
+  reg('view_dispatcher_send_custom_event',            ()=>{});
+  reg('view_dispatcher_set_event_callback_context',   (uc)=>{vdCtx=rr(uc,1);});
+  reg('view_dispatcher_set_custom_event_callback',    (uc)=>{vdCustomCb=rr(uc,1);});
+  reg('view_dispatcher_set_navigation_event_callback',(uc)=>{vdNavCb=rr(uc,1);});
+  reg('view_dispatcher_set_tick_event_callback',      ()=>{});
+
+  /* Phase 3: View */
+  reg('view_alloc',             (uc)=>mm(uc,128));
+  reg('view_free',              ()=>{});
+  reg('view_set_draw_callback', (uc)=>{vpDraw=rr(uc,1);vpCtx=rr(uc,2);log(`[VIEW] draw_cb=0x${rr(uc,1).toString(16)}`);});
+  reg('view_set_input_callback',(uc)=>{vpInput=rr(uc,1);});
+  reg('view_set_context',       (uc)=>{vpCtx=rr(uc,1);});
+  reg('view_set_previous_callback',()=>{});
+  reg('view_set_update_callback',  ()=>{});
+  reg('view_get_model',         (uc)=>mm(uc,512));
+  reg('view_commit_model',      ()=>{});
+  reg('view_get_view',          (uc)=>rr(uc,0));
+
+  /* Phase 3: SceneManager */
+  reg('scene_manager_alloc',                           (uc)=>mm(uc,64));
+  reg('scene_manager_free',                            ()=>{});
+  reg('scene_manager_next_scene',                      (uc)=>log(`[SM] next_scene(${rr(uc,1)})`));
+  reg('scene_manager_previous_scene',                  ()=>false);
+  reg('scene_manager_set_scene_state',                 ()=>{});
+  reg('scene_manager_get_scene_state',                 ()=>0);
+  reg('scene_manager_handle_custom_event',             ()=>false);
+  reg('scene_manager_handle_back_event',               ()=>false);
+  reg('scene_manager_stop',                            ()=>{});
+  reg('scene_manager_search_and_switch_to_previous_scene',()=>false);
+  reg('scene_manager_has_previous_scene',              ()=>false);
+
+  /* Phase 3: Submenu */
+  reg('submenu_alloc',          (uc)=>mm(uc,128));
+  reg('submenu_free',           ()=>{});
+  reg('submenu_reset',          ()=>{});
+  reg('submenu_add_item',       (uc)=>{log(`[UI] submenu: "${rs(uc,rr(uc,1))}"`);});
+  reg('submenu_set_selected_item',()=>{});
+  reg('submenu_set_header',     ()=>{});
+  reg('submenu_get_view',       (uc)=>mm(uc,64));
+
+  /* Phase 3: Popup */
+  reg('popup_alloc',            (uc)=>mm(uc,64));
+  reg('popup_free',             ()=>{});
+  reg('popup_get_view',         (uc)=>mm(uc,64));
+  reg('popup_set_text',         ()=>{});
+  reg('popup_set_header',       ()=>{});
+  reg('popup_set_callback',     ()=>{});
+  reg('popup_set_context',      ()=>{});
+  reg('popup_set_timeout',      ()=>{});
+
+  /* Phase 3: TextBox */
+  reg('text_box_alloc',         (uc)=>mm(uc,128));
+  reg('text_box_free',          ()=>{});
+  reg('text_box_get_view',      (uc)=>mm(uc,64));
+  reg('text_box_set_text',      ()=>{});
+  reg('text_box_set_font',      ()=>{});
+  reg('text_box_set_focus',     ()=>{});
+  reg('text_box_reset',         ()=>{});
+
+  /* Phase 3: TextInput */
+  reg('text_input_alloc',              (uc)=>mm(uc,128));
+  reg('text_input_free',               ()=>{});
+  reg('text_input_get_view',           (uc)=>mm(uc,64));
+  reg('text_input_set_result_callback',()=>{});
+  reg('text_input_set_header_text',    ()=>{});
+
+  /* Phase 3: DialogEx */
+  reg('dialog_ex_alloc',               (uc)=>mm(uc,64));
+  reg('dialog_ex_free',                ()=>{});
+  reg('dialog_ex_get_view',            (uc)=>mm(uc,64));
+  reg('dialog_ex_set_header',          ()=>{});
+  reg('dialog_ex_set_text',            ()=>{});
+  reg('dialog_ex_set_left_button_text',()=>{});
+  reg('dialog_ex_set_right_button_text',()=>{});
+  reg('dialog_ex_set_center_button_text',()=>{});
+  reg('dialog_ex_set_result_callback', ()=>{});
+  reg('dialog_ex_reset',               ()=>{});
+
+  /* Phase 3: VariableItemList */
+  reg('variable_item_list_alloc',            (uc)=>mm(uc,128));
+  reg('variable_item_list_free',             ()=>{});
+  reg('variable_item_list_get_view',         (uc)=>mm(uc,64));
+  reg('variable_item_list_add',              (uc)=>mm(uc,32));
+  reg('variable_item_list_reset',            ()=>{});
+  reg('variable_item_list_set_enter_callback',()=>{});
+  reg('variable_item_set_current_value_index',()=>{});
+  reg('variable_item_set_current_value_text', ()=>{});
+  reg('variable_item_get_current_value_index',()=>0);
+  reg('variable_item_get_context',           ()=>0);
+
+  /* Phase 3: Loading / Menu */
+  reg('loading_alloc',  (uc)=>mm(uc,32));
+  reg('loading_free',   ()=>{});
+  reg('loading_get_view',(uc)=>mm(uc,32));
+  reg('menu_alloc',     (uc)=>mm(uc,128));
+  reg('menu_free',      ()=>{});
+  reg('menu_get_view',  (uc)=>mm(uc,64));
+
+  /* Memory */
+  reg('malloc',    (uc)=>mm(uc,rr(uc,0)));
+  reg('calloc',    (uc)=>mm(uc,rr(uc,0)*rr(uc,1)));
+  reg('realloc',   (uc)=>mm(uc,rr(uc,1)));
+  reg('free',      ()=>{});
+  reg('furi_alloc',(uc)=>mm(uc,rr(uc,0)));
+  reg('furi_free', ()=>{});
+  reg('memset',(uc)=>{const p=rr(uc,0),v=rr(uc,1),n=rr(uc,2);try{if(p)uc.mem_write(p,new Uint8Array(n).fill(v&0xFF));}catch(e){}return p;});
+  reg('memcpy',(uc)=>{const dst=rr(uc,0),src=rr(uc,1),n=rr(uc,2);try{if(dst&&src)uc.mem_write(dst,uc.mem_read(src,n));}catch(e){}return dst;});
+  reg('memmove',(uc)=>{const dst=rr(uc,0),src=rr(uc,1),n=rr(uc,2);try{if(dst&&src)uc.mem_write(dst,uc.mem_read(src,n));}catch(e){}return dst;});
+  reg('memcmp',   ()=>0);
+  reg('strlen',   (uc)=>rs(uc,rr(uc,0)).length);
+  reg('strcmp',   (uc)=>{const a=rs(uc,rr(uc,0)),b=rs(uc,rr(uc,1));return a<b?-1:a>b?1:0;});
+  reg('strncmp',  ()=>0); reg('strcpy',(uc)=>rr(uc,0)); reg('strncpy',(uc)=>rr(uc,0));
+  reg('strcat',   (uc)=>rr(uc,0)); reg('sprintf',()=>0); reg('snprintf',()=>0); reg('printf',()=>0);
+
+  /* Timer */
+  reg('furi_timer_alloc', (uc)=>mm(uc,32)); reg('furi_timer_free',()=>{});
+  reg('furi_timer_start', ()=>0); reg('furi_timer_stop',()=>0);
+  reg('furi_delay_ms',()=>{}); reg('furi_delay_us',()=>{});
+  reg('furi_get_tick',()=>Date.now()&0xFFFFFFFF);
+  reg('furi_hal_delay_ms',()=>{}); reg('furi_hal_delay_us',()=>{});
+
+  /* Mutex / Semaphore / Events */
+  reg('furi_mutex_alloc',(uc)=>mm(uc,16)); reg('furi_mutex_free',()=>{});
+  reg('furi_mutex_acquire',()=>0); reg('furi_mutex_release',()=>0);
+  reg('furi_semaphore_alloc',(uc)=>mm(uc,16)); reg('furi_semaphore_free',()=>{});
+  reg('furi_semaphore_release',()=>0); reg('furi_semaphore_acquire',()=>0);
+  reg('furi_event_flag_alloc',(uc)=>mm(uc,16)); reg('furi_event_flag_free',()=>{});
+  reg('furi_event_flag_set',()=>0); reg('furi_event_flag_get',()=>0); reg('furi_event_flag_wait',()=>0);
+
+  /* Message queue */
+  reg('furi_message_queue_alloc',(uc)=>mm(uc,64));
+  reg('furi_message_queue_free',()=>{});
+  reg('furi_message_queue_put',()=>0);
+  reg('furi_message_queue_get',(uc)=>{const q=inputQueueRef.current;if(q.length>0){const evt=q.shift();const buf=rr(uc,1);if(buf)w32(uc,buf,evt.key|(evt.type<<8));return 0;}return 5;});
+
+  /* Thread */
+  reg('furi_thread_alloc',(uc)=>mm(uc,64)); reg('furi_thread_free',()=>{});
+  reg('furi_thread_start',()=>0); reg('furi_thread_join',()=>0);
+  reg('furi_thread_get_current_id',()=>1);
+  reg('furi_thread_set_name',()=>{}); reg('furi_thread_set_stack_size',()=>{});
+  reg('furi_thread_set_callback',()=>{}); reg('furi_thread_set_context',()=>{});
+  reg('furi_thread_set_priority',()=>{}); reg('furi_thread_mark_as_service',()=>{});
+
+  /* Notifications / Storage — fail gracefully */
+  reg('notification_message',()=>{}); reg('notification_message_block',()=>{});
+  reg('storage_file_alloc',(uc)=>mm(uc,32)); reg('storage_file_free',()=>{});
+  reg('storage_file_open',()=>0); reg('storage_file_close',()=>{});
+  reg('storage_file_read',()=>0); reg('storage_file_write',()=>0);
+  reg('storage_file_size',()=>0); reg('storage_file_eof',()=>1);
+  reg('storage_file_exists',()=>0); reg('storage_common_mkdir',()=>0);
+  reg('storage_common_stat',()=>1); reg('storage_common_remove',()=>0);
+
+  stubs._regUnknown=(name)=>{if(stubs[name]!==undefined)return;reg(name,()=>{log(`[STUB] unhandled: ${name}`);return 0;});};
+  stubs._nextAddr=()=>nextAddr;
+  return{stubs,handlers};
 }
-function FlipperScreen({ canvasRef, scale }) {
-  return (
-    <div
-      style={{
-        background:'#1a1a2e',
-        padding:'6px',
-        borderRadius:4,
-        border:'2px solid #252545',
-        boxShadow:'0 0 24px rgba(155,188,15,0.2)'
-      }}
-    >
-      <canvas
-        ref={canvasRef}
-        width={LCD_W * scale}
-        height={LCD_H * scale}
-      />
+
+/* ── ELF Loader ────────────────────────────────────────────────────────── */
+function loadFAP(uc,fap,stubs,log){
+  const u8=new Uint8Array(fap.buffer),view=new DataView(fap.buffer),le=true;
+  const rs=(o,max=64)=>{let s='';for(let i=0;i<max;i++){const c=u8[o+i];if(!c)break;s+=String.fromCharCode(c);}return s;};
+  const w32=(addr,val)=>{const b=new Uint8Array(4);new DataView(b.buffer).setUint32(0,val,le);uc.mem_write(addr,b);};
+  uc.mem_map(LOAD_BASE,2*1024*1024,7);uc.mem_map(RAM_BASE,2*1024*1024,6);uc.mem_map(STUB_BASE,1*1024*1024,7);
+  const sc=new Uint8Array(1024*4);for(let i=0;i<1024;i++){sc[i*4]=0x70;sc[i*4+1]=0x47;}uc.mem_write(STUB_BASE,sc);
+  const sec=n=>fap.rawSections.find(s=>s.name===n);
+  const textSec=sec('.text');const baseVA=textSec?.addr??LOAD_BASE;const delta=LOAD_BASE-baseVA;
+  const ls=s=>{if(!s||!s.size)return;const dst=s.addr+delta;uc.mem_write(dst,u8.slice(s.offset,s.offset+s.size));log(`[LOAD] ${s.name} @ 0x${dst.toString(16)} (${s.size}B)`);};
+  ls(textSec);ls(sec('.rodata'));ls(sec('.data'));ls(sec('.got'));ls(sec('.got.plt'));
+  const bss=sec('.bss');if(bss)try{uc.mem_write(bss.addr+delta,new Uint8Array(bss.size));}catch(e){}
+  const dynsym=sec('.dynsym'),dynstr=sec('.dynstr');
+  for(const rel of fap.relSections){
+    const hasA=rel.name.startsWith('.rela'),ent=hasA?12:8,cnt=Math.floor(rel.size/ent);
+    for(let i=0;i<cnt;i++){
+      const o=rel.offset+i*ent,offset=view.getUint32(o,le)+delta,info=view.getUint32(o+4,le);
+      const symIdx=info>>8,relType=info&0xFF,addend=hasA?view.getInt32(o+8,le):0;
+      let symName='';if(dynsym&&dynstr&&symIdx>0){const so=dynsym.offset+symIdx*(dynsym.entsize||16);symName=rs(dynstr.offset+view.getUint32(so,le));}
+      if(relType===21||relType===22){stubs._regUnknown(symName);const sa=stubs[symName];if(sa!==undefined){w32(offset,sa);log(`[REL] ${symName}`);}}
+      else if(relType===23){w32(offset,LOAD_BASE+addend);}
+      else if(relType===2){try{const cur=view.getUint32(offset,le);w32(offset,cur+(LOAD_BASE-baseVA));}catch(e){}}
+    }
+  }
+  uc.reg_write(RP.SP,STACK_TOP);uc.reg_write(RP.LR,0xFEFEFEFE);
+  const entry=(fap.eEntry+delta)|1;log(`[EMU] Entry: 0x${entry.toString(16)}`);return entry;
+}
+
+/* ── Helpers ───────────────────────────────────────────────────────────── */
+function useWindowWidth(){const[w,setW]=useState(window.innerWidth);useEffect(()=>{const h=()=>setW(window.innerWidth);window.addEventListener('resize',h);return()=>window.removeEventListener('resize',h);},[]);return w;}
+
+/* ── Components ────────────────────────────────────────────────────────── */
+function ZoomModal({canvasRef,onClose}){
+  const bigRef=useRef();
+  useEffect(()=>{if(!bigRef.current||!canvasRef.current)return;const ctx=bigRef.current.getContext('2d');ctx.imageSmoothingEnabled=false;ctx.drawImage(canvasRef.current,0,0,LCD_W*6,LCD_H*6);});
+  return(
+    <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.93)',zIndex:999,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:12,padding:16}}>
+      <div onClick={e=>e.stopPropagation()} style={{background:'#111',border:'4px solid #1a1a2e',borderRadius:4,padding:6,boxShadow:'0 0 60px rgba(155,188,15,0.4)',maxWidth:'100%'}}>
+        <canvas ref={bigRef} width={LCD_W*6} height={LCD_H*6} style={{display:'block',imageRendering:'pixelated',maxWidth:'100%',height:'auto'}}/>
+      </div>
+      <div style={{fontSize:10,color:'rgba(155,188,15,0.4)',letterSpacing:'0.12em'}}>768×384 · 6× ZOOM</div>
+      <button onClick={onClose} style={{background:'transparent',border:'1px solid rgba(255,255,255,0.2)',color:'rgba(255,255,255,0.5)',padding:'8px 24px',fontFamily:'monospace',fontSize:11,cursor:'pointer',borderRadius:3}}>[ CLOSE ]</button>
     </div>
   );
 }
-function DPad({ onInput }) {
-  const D = 42;
-  const btnStyle = {
-    background:'rgba(255,255,255,0.06)',
-    border:'1px solid rgba(255,255,255,0.1)',
-    color:'rgba(255,255,255,0.65)',
-    borderRadius:4,
-    cursor:'pointer',
-    width:D,
-    height:D
-  };
-  const btn = (label, key) => (
-    <button
-      onPointerDown={() => onInput(key, InputType.Press)}
-      onPointerUp={() => onInput(key, InputType.Release)}
-      style={btnStyle}
-    >
+
+function FlipperScreen({canvasRef,scale,onZoom}){
+  return(
+    <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:6}}>
+      <div style={{position:'relative',display:'inline-block'}}>
+        <div style={{background:'#1a1a2e',padding:'6px 6px 4px',borderRadius:4,boxShadow:'0 0 24px rgba(155,188,15,0.2)',border:'2px solid #252545'}}>
+          <canvas ref={canvasRef} width={LCD_W*scale} height={LCD_H*scale} style={{display:'block',imageRendering:'pixelated'}}/>
+        </div>
+        <button onClick={onZoom} style={{position:'absolute',top:3,right:3,background:'rgba(0,0,0,0.85)',border:'1px solid rgba(255,255,255,0.12)',color:'rgba(255,255,255,0.45)',width:22,height:22,fontSize:12,cursor:'pointer',borderRadius:2,display:'flex',alignItems:'center',justifyContent:'center',fontFamily:'monospace',padding:0}}>⛶</button>
+      </div>
+      <div style={{fontSize:9,color:'rgba(255,255,255,0.12)',letterSpacing:'0.14em'}}>128×64 · MONOCHROME LCD</div>
+    </div>
+  );
+}
+
+function DPad({onInput}){
+  const D=44;
+  const b=(label,key,accent)=>(
+    <button onPointerDown={e=>{e.preventDefault();onInput(key,InputType.Press);}} onPointerUp={e=>{e.preventDefault();onInput(key,InputType.Release);}}
+      style={{width:D,height:D,background:accent?'rgba(255,140,0,0.15)':'rgba(255,255,255,0.06)',border:`1px solid ${accent?'rgba(255,140,0,0.35)':'rgba(255,255,255,0.1)'}`,color:accent?'#ff9900':'rgba(255,255,255,0.65)',borderRadius:4,cursor:'pointer',fontFamily:'monospace',fontSize:12,display:'flex',alignItems:'center',justifyContent:'center',userSelect:'none',WebkitUserSelect:'none',touchAction:'none'}}>
       {label}
     </button>
   );
-  return (
-    <div
-      style={{
-        display:'grid',
-        gridTemplateColumns:`${D}px ${D}px ${D}px`,
-        gap:4
-      }}
-    >
-      <span></span>
-      {btn('▲', InputKey.Up)}
-      <span></span>
-      {btn('◀', InputKey.Left)}
-      {btn('OK', InputKey.Ok)}
-      {btn('▶', InputKey.Right)}
-      <span></span>
-      {btn('▼', InputKey.Down)}
-      <span></span>
+  return(
+    <div style={{display:'flex',gap:14,alignItems:'center',justifyContent:'center',flexWrap:'wrap'}}>
+      <div style={{display:'grid',gridTemplateColumns:`${D}px ${D}px ${D}px`,gridTemplateRows:`${D}px ${D}px ${D}px`,gap:3}}>
+        <span/>{b('▲',InputKey.Up)}<span/>
+        {b('◀',InputKey.Left)}{b('OK',InputKey.Ok,true)}{b('▶',InputKey.Right)}
+        <span/>{b('▼',InputKey.Down)}<span/>
+      </div>
+      {b('BACK',InputKey.Back)}
     </div>
   );
 }
-function App() {
-  const canvasRef = useRef();
-  const displayRef = useRef(
-    new FlipperDisplay()
+
+function ImportTable({imports}){
+  const[filter,setFilter]=useState('all');
+  const SC={STUBBABLE:'#22c55e',PARTIAL:'#eab308',STUB:'#f97316',HARDWARE:'#ef4444',UNKNOWN:'#6b7280'};
+  const grouped={};imports.forEach(i=>{const c=categorize(i.name);(grouped[c.key]||(grouped[c.key]={cat:c,items:[]})).items.push(i);});
+  const counts={};imports.forEach(i=>{const{status}=categorize(i.name);counts[status]=(counts[status]||0)+1;});
+  const unknownCount=counts['UNKNOWN']||0;
+  const hwCount=counts['HARDWARE']||0;
+  const statuses=['all','STUBBABLE','PARTIAL','STUB','HARDWARE','UNKNOWN'];
+  const filtered=filter==='all'?Object.values(grouped):Object.values(grouped).filter(g=>g.cat.status===filter);
+  return(
+    <div>
+      {/* Phase 3: warnings for unknown/hardware symbols */}
+      {unknownCount>0&&<div style={{background:'rgba(107,114,128,0.1)',border:'1px solid rgba(107,114,128,0.3)',borderRadius:4,padding:'6px 10px',fontSize:10,color:'#9ca3af',marginBottom:8}}>⚠ {unknownCount} unknown symbol{unknownCount>1?'s':''} — app may crash or behave incorrectly</div>}
+      {hwCount>0&&<div style={{background:'rgba(239,68,68,0.07)',border:'1px solid rgba(239,68,68,0.2)',borderRadius:4,padding:'6px 10px',fontSize:10,color:'#f87171',marginBottom:8}}>ℹ {hwCount} hardware stub{hwCount>1?'s':''} — SubGHz / NFC / BT are NO-OPs, no real hardware access</div>}
+      <div style={{display:'flex',gap:4,flexWrap:'wrap',marginBottom:12}}>
+        {statuses.map(s=>{const col=s==='all'?'#888':SC[s];const cnt=s==='all'?imports.length:(counts[s]||0);return(<button key={s} onClick={()=>setFilter(s)} style={{fontSize:10,padding:'2px 7px',borderRadius:3,cursor:'pointer',fontFamily:'monospace',background:`${col}18`,color:col,border:`1px solid ${col}33`,opacity:filter===s?1:0.45}}>{s==='all'?'ALL':s} ({cnt})</button>);})}
+      </div>
+      {filtered.map(({cat,items})=>(
+        <div key={cat.key} style={{marginBottom:10}}>
+          <div style={{fontSize:10,letterSpacing:'0.1em',color:'rgba(255,140,0,0.4)',marginBottom:4,textTransform:'uppercase'}}>{cat.label}</div>
+          {items.map(i=>(<div key={i.name} style={{display:'flex',alignItems:'center',gap:6,padding:'3px 6px',borderRadius:3,marginBottom:2,background:cat.bg}}><span style={{fontSize:11,color:'#e2e8f0',flex:1,fontFamily:'monospace',wordBreak:'break-all'}}>{i.name}</span><span style={{fontSize:9,padding:'1px 5px',borderRadius:2,background:`${cat.color}22`,color:cat.color,border:`1px solid ${cat.color}44`,whiteSpace:'nowrap'}}>{cat.status}</span></div>))}
+        </div>
+      ))}
+    </div>
   );
-  const [logs, setLogs] = useState([]);
-  const winW = useWindowWidth();
-  const mobile = winW < 600;
-  const scale = mobile ? 3 : 4;
-  const addLog = useCallback((msg) => {
-    setLogs(l => [...l, msg]);
-  }, []);
-  const renderDisplay = useCallback(() => {
-    if (canvasRef.current) {
-      displayRef.current.render(
-        canvasRef.current,
-        scale
-      );
-    }
-  }, [scale]);
-  useEffect(() => {
-    const d = displayRef.current;
-    d.clear();
-    d.box(10, 10, 40, 20);
-    d.box(70, 20, 30, 15);
-    renderDisplay();
-  }, [renderDisplay]);
-  const onDpad = (key, type) => {
-    addLog(
-      `Input: ${
-        Object.keys(InputKey)[key]
-      } ${
-        type === 0
-          ? 'DOWN'
-          : 'UP'
-      }`
-    );
+}
+
+function LogPanel({logs}){
+  const ref=useRef();useEffect(()=>{if(ref.current)ref.current.scrollTop=ref.current.scrollHeight;},[logs]);
+  return(<div ref={ref} style={{height:200,overflowY:'auto',fontFamily:'monospace',fontSize:10,lineHeight:1.7,background:'#050805',border:'1px solid rgba(155,188,15,0.12)',borderRadius:4,padding:'8px 10px',color:'rgba(155,188,15,0.7)'}}>
+    {logs.length===0&&<span style={{opacity:0.3}}>No output — load a .fap and press RUN</span>}
+    {logs.map((l,i)=><div key={i} style={{color:l.startsWith('[ERR]')?'#f87171':l.startsWith('[STUB]')?'rgba(234,179,8,0.5)':'rgba(155,188,15,0.7)'}}>{l}</div>)}
+  </div>);
+}
+
+/* ── Main App ───────────────────────────────────────────────────────────── */
+function App(){
+  const[fap,setFap]          =useState(null);
+  const[error,setError]      =useState(null);
+  const[drag,setDrag]        =useState(false);
+  const[zoomed,setZoomed]    =useState(false);
+  const[emuState,setEmuState]=useState('idle');
+  const[logs,setLogs]        =useState([]);
+  const[ucReady,setUcReady]  =useState(false);
+  const[ucErr,setUcErr]      =useState(null);
+  const[tab,setTab]          =useState('info');
+
+  const canvasRef   =useRef();
+  const fileRef     =useRef();
+  const displayRef  =useRef(new FlipperDisplay());
+  const ucRef       =useRef(null);
+  const inputQueue  =useRef([]);
+  const loopRef     =useRef(null);
+  const emuStateRef =useRef('idle');
+
+  const winW=useWindowWidth();
+  const mobile=winW<600,tablet=winW<960;
+  const scale=mobile?3:4;
+
+  const addLog=useCallback(msg=>setLogs(l=>[...l.slice(-200),msg]),[]);
+  const renderDisplay=useCallback(()=>{if(canvasRef.current)displayRef.current.render(canvasRef.current,scale);},[scale]);
+  useEffect(()=>renderDisplay(),[renderDisplay]);
+
+  /* Load Unicorn.js */
+  useEffect(()=>{
+    if(window.uc){setUcReady(true);return;}
+    const try2=(url,fb)=>{const s=document.createElement('script');s.src=url;s.onload=()=>{setUcReady(true);addLog('[EMU] Unicorn.js loaded ✓');};s.onerror=()=>{if(fb)fb();else setUcErr('Unicorn.js unavailable. Download unicorn.js from github.com/AlexAltea/unicorn.js and add a <script src="unicorn.js"> tag.');};document.head.appendChild(s);};
+    try2('https://cdn.jsdelivr.net/npm/unicorn.js/unicorn.js',()=>try2('https://unpkg.com/unicorn.js/unicorn.js',null));
+  },[addLog]);
+
+  /* Keyboard */
+  useEffect(()=>{
+    const dn=e=>{const k=KEY_MAP[e.key];if(k!==undefined){e.preventDefault();inputQueue.current.push({key:k,type:InputType.Press});}};
+    const up=e=>{const k=KEY_MAP[e.key];if(k!==undefined)inputQueue.current.push({key:k,type:InputType.Release});};
+    window.addEventListener('keydown',dn);window.addEventListener('keyup',up);
+    return()=>{window.removeEventListener('keydown',dn);window.removeEventListener('keyup',up);};
+  },[]);
+
+  const handleFile=useCallback(file=>{
+    if(!file)return;
+    setError(null);setFap(null);setEmuState('idle');emuStateRef.current='idle';setLogs([]);
+    displayRef.current.clear();renderDisplay();
+    const reader=new FileReader();
+    reader.onload=e=>{try{const r=parseELF(e.target.result);setFap({...r,fileName:file.name});}catch(err){setError(err.message);}};
+    reader.readAsArrayBuffer(file);
+  },[renderDisplay]);
+
+  const runFAP=useCallback(async()=>{
+    if(!fap||!ucReady||!window.uc){addLog('[ERR] Unicorn.js not ready');return;}
+    setEmuState('running');emuStateRef.current='running';
+    setLogs([]);displayRef.current.clear();renderDisplay();
+    try{
+      const uc=new window.uc.Unicorn(window.uc.ARCH_ARM,window.uc.MODE_THUMB);
+      ucRef.current=uc;
+      const{stubs,handlers}=buildStubs(displayRef.current,inputQueue,addLog);
+      uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
+        const h=handlers[addr];
+        if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e.message}`);ret=0;}if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);const lr=uc_h.reg_read(RP.LR)>>>0;uc_h.reg_write(RP.PC,lr&~1);if(addr===stubs['canvas_commit'])renderDisplay();}
+        if((uc_h.reg_read(RP.PC)>>>0)===0xFEFEFEFE)uc_h.emu_stop();
+      },STUB_BASE,STUB_BASE+0x100000);
+      const entry=loadFAP(uc,fap,stubs,addLog);
+      addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
+      try{uc.emu_start(entry,0xFEFEFEFE,0,2000000);}catch(e){addLog(`[EMU] init: ${e.message}`);}
+      renderDisplay();
+      const tick=()=>{
+        if(emuStateRef.current!=='running'){loopRef.current=null;return;}
+        try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,5000);renderDisplay();}catch(e){}
+        loopRef.current=requestAnimationFrame(tick);
+      };
+      loopRef.current=requestAnimationFrame(tick);
+    }catch(e){addLog(`[ERR] ${e.message}`);setEmuState('error');emuStateRef.current='error';}
+  },[fap,ucReady,addLog,renderDisplay]);
+
+  const stopFAP=()=>{
+    emuStateRef.current='stopped';if(loopRef.current)cancelAnimationFrame(loopRef.current);
+    try{if(ucRef.current)ucRef.current.emu_stop();}catch(e){}
+    setEmuState('idle');addLog('[EMU] Stopped.');
   };
-  return (
-    <div style={{padding:20}}>
-      <div
-        style={{
-          display:'flex',
-          alignItems:'center',
-          gap:10,
-          marginBottom:20
-        }}
-      >
-        <div
-          style={{
-            fontWeight:'bold',
-            fontSize:18
-          }}
-        >
-          <span style={{color:'#ff9900'}}>
-            FLIPPER
-          </span>
-          {' '}
-          EMU
+
+  const statusColor={idle:'#6b7280',loading:'#eab308',running:'#22c55e',error:'#ef4444',stopped:'#6b7280'}[emuState]||'#6b7280';
+  const P={background:'rgba(255,255,255,0.025)',border:'1px solid rgba(255,140,0,0.1)',borderRadius:6,padding:mobile?10:14};
+  const PT={fontSize:10,letterSpacing:'0.2em',color:'rgba(255,140,0,0.45)',marginBottom:10,textTransform:'uppercase'};
+  const fmt=n=>n>=1024?`${(n/1024).toFixed(1)}KB`:`${n}B`;
+
+  return(
+    <div style={{fontFamily:"'Courier New',monospace",background:'#06070f',color:'#e2e8f0',minHeight:'100vh',display:'flex',flexDirection:'column'}}>
+      <div style={{flex:1,padding:mobile?8:20}}>
+
+        {/* Header */}
+        <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:14,borderBottom:'1px solid rgba(255,140,0,0.12)',paddingBottom:12,flexWrap:'wrap'}}>
+          <div style={{fontSize:mobile?14:17,fontWeight:'bold'}}><span style={{color:'#ff9900'}}>FAP</span> EMU</div>
+          <div style={{fontSize:9,color:'rgba(255,140,0,0.35)',letterSpacing:'0.16em'}}>FLIPPER-COMPATIBLE APP EMULATOR · PHASE 3</div>
+          <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:8}}>
+            <div style={{width:7,height:7,borderRadius:'50%',background:statusColor,boxShadow:`0 0 6px ${statusColor}`}}/>
+            <span style={{fontSize:9,color:statusColor,letterSpacing:'0.1em'}}>{emuState.toUpperCase()}</span>
+          </div>
         </div>
+
+        {/* Phase 3: safety banner */}
+        <div style={{background:'rgba(255,140,0,0.05)',border:'1px solid rgba(255,140,0,0.15)',borderRadius:4,padding:'6px 12px',fontSize:10,color:'rgba(255,140,0,0.55)',marginBottom:10,display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+          <span>🔒 Runs in sandboxed environment · No hardware access · SubGHz / NFC / BT are not simulated</span>
+        </div>
+
+        {!ucReady&&!ucErr&&<div style={{background:'rgba(234,179,8,0.07)',border:'1px solid rgba(234,179,8,0.2)',borderRadius:4,padding:'6px 10px',fontSize:10,color:'#eab308',marginBottom:8}}>⟳ Loading Unicorn.js ARM emulator...</div>}
+        {ucErr&&<div style={{background:'rgba(239,68,68,0.07)',border:'1px solid rgba(239,68,68,0.2)',borderRadius:4,padding:'6px 10px',fontSize:10,color:'#f87171',marginBottom:8}}>⚠ {ucErr}</div>}
+        {error&&<div style={{background:'rgba(239,68,68,0.08)',border:'1px solid rgba(239,68,68,0.25)',borderRadius:6,padding:12,color:'#fca5a5',fontSize:12,marginBottom:10}}>⚠ {error}</div>}
+
+        {/* Drop zone */}
+        {!fap&&(
+          <div style={{border:`2px dashed ${drag?'#ff9900':'rgba(255,140,0,0.22)'}`,borderRadius:8,background:drag?'rgba(255,140,0,0.04)':'transparent',padding:mobile?28:56,textAlign:'center',cursor:'pointer',transition:'all 0.2s'}}
+            onDrop={e=>{e.preventDefault();setDrag(false);handleFile(e.dataTransfer.files[0]);}}
+            onDragOver={e=>{e.preventDefault();setDrag(true);}} onDragLeave={()=>setDrag(false)}
+            onClick={()=>fileRef.current.click()}>
+            <div style={{fontSize:36,marginBottom:8,opacity:0.3}}>📦</div>
+            <div style={{fontSize:mobile?13:15,color:'rgba(255,255,255,0.5)',marginBottom:4}}>Drop a .fap file here</div>
+            <div style={{fontSize:10,color:'rgba(255,140,0,0.3)',letterSpacing:'0.1em'}}>OR TAP TO BROWSE · USER-PROVIDED BINARY</div>
+            <input ref={fileRef} type="file" accept=".fap" onChange={e=>handleFile(e.target.files[0])}/>
+          </div>
+        )}
+
+        {fap&&(
+          <>
+            {/* Phase 3: user-provided binary warning */}
+            <div style={{background:'rgba(234,179,8,0.06)',border:'1px solid rgba(234,179,8,0.2)',borderRadius:4,padding:'5px 10px',fontSize:10,color:'rgba(234,179,8,0.7)',marginBottom:10}}>
+              ⚠ User-provided binary: <span style={{color:'#ff9900'}}>{fap.fileName}</span> — not verified or endorsed
+            </div>
+
+            <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:12,flexWrap:'wrap'}}>
+              <span style={{fontSize:11,color:'rgba(255,255,255,0.3)'}}>{fmt(fap.fileSize)} · {fap.imports.length} imports · {fap.isDyn?'PIC':'static'}</span>
+              <div style={{marginLeft:'auto',display:'flex',gap:6}}>
+                {emuState==='running'
+                  ?<button onClick={stopFAP} style={{padding:'5px 12px',background:'rgba(239,68,68,0.12)',border:'1px solid rgba(239,68,68,0.35)',color:'#f87171',borderRadius:3,fontSize:10,cursor:'pointer',fontFamily:'monospace',letterSpacing:'0.1em'}}>■ STOP</button>
+                  :<button onClick={runFAP} disabled={!ucReady} style={{padding:'5px 12px',background:ucReady?'rgba(34,197,94,0.12)':'rgba(255,255,255,0.03)',border:`1px solid ${ucReady?'rgba(34,197,94,0.35)':'rgba(255,255,255,0.08)'}`,color:ucReady?'#22c55e':'rgba(255,255,255,0.18)',borderRadius:3,fontSize:10,cursor:ucReady?'pointer':'default',fontFamily:'monospace',letterSpacing:'0.1em'}}>▶ RUN</button>
+                }
+                <button onClick={()=>{stopFAP();setFap(null);setError(null);}} style={{padding:'5px 10px',background:'transparent',border:'1px solid rgba(255,255,255,0.08)',color:'rgba(255,255,255,0.25)',borderRadius:3,fontSize:10,cursor:'pointer',fontFamily:'monospace'}}>EJECT</button>
+              </div>
+            </div>
+
+            <div style={{display:'grid',gridTemplateColumns:mobile?'1fr':tablet?'auto 1fr':'auto 1fr',gap:10,alignItems:'start'}}>
+              <div style={{display:'flex',flexDirection:'column',gap:10,alignItems:mobile?'center':'flex-start'}}>
+                <div style={P}><FlipperScreen canvasRef={canvasRef} scale={scale} onZoom={()=>setZoomed(true)}/></div>
+                <div style={P}>
+                  <div style={PT}>CONTROLS · ARROWS / ENTER / ESC</div>
+                  <DPad onInput={(key,type)=>{inputQueue.current.push({key,type});if(emuState!=='running')addLog(`[INPUT] ${Object.keys(InputKey)[key]} ${type===0?'↓':'↑'}`);}}/>
+                </div>
+              </div>
+
+              <div style={P}>
+                <div style={{display:'flex',gap:2,marginBottom:12,flexWrap:'wrap'}}>
+                  {[['info','INFO'],['imports',`IMPORTS (${fap.imports.length})`],['log','LOG']].map(([k,l])=>(
+                    <button key={k} onClick={()=>setTab(k)} style={{padding:'4px 10px',borderRadius:'3px 3px 0 0',border:'1px solid',fontFamily:'monospace',fontSize:10,cursor:'pointer',background:tab===k?'rgba(255,140,0,0.12)':'transparent',borderColor:tab===k?'rgba(255,140,0,0.35)':'rgba(255,255,255,0.07)',color:tab===k?'#ff9900':'rgba(255,255,255,0.25)'}}>{l}</button>
+                  ))}
+                </div>
+
+                {tab==='info'&&(
+                  <div>
+                    {[['App Name',fap.appName??'—'],['App ID',fap.appId??'—'],['File',fap.fileName],['Size',fmt(fap.fileSize)],['Format',fap.isDyn?'ARM ELF (PIC)':'ARM ELF'],['Entry',`0x${fap.eEntry.toString(16).padStart(8,'0')}`],['Sections',fap.sections.length],['Imports',fap.imports.length],['.text',fmt(fap.textSize)],['.rodata',fmt(fap.rodataSize)],['.data',fmt(fap.dataSize)],['.bss',fmt(fap.bssSize)]].map(([k,v])=>(
+                      <div key={k} style={{display:'flex',justifyContent:'space-between',padding:'4px 0',borderBottom:'1px solid rgba(255,255,255,0.04)'}}><span style={{fontSize:11,color:'rgba(255,255,255,0.3)'}}>{k}</span><span style={{fontSize:11,color:'#e2e8f0',fontFamily:'monospace'}}>{v}</span></div>
+                    ))}
+                    {(()=>{const s=fap.imports.filter(i=>['STUBBABLE','PARTIAL'].includes(categorize(i.name).status)).length;const pct=Math.round((s/Math.max(1,fap.imports.length))*100);return(
+                      <div style={{marginTop:14}}>
+                        <div style={{fontSize:10,color:'rgba(255,255,255,0.25)',marginBottom:6}}>EMU READINESS</div>
+                        <div style={{display:'flex',height:5,borderRadius:3,overflow:'hidden',marginBottom:5}}><div style={{width:`${pct}%`,background:'#22c55e'}}/><div style={{flex:1,background:'rgba(239,68,68,0.35)'}}/></div>
+                        <div style={{display:'flex',justifyContent:'space-between',fontSize:10}}><span style={{color:'#22c55e'}}>{s} stubbable</span><span style={{color:'rgba(255,255,255,0.25)'}}>{pct}%</span><span style={{color:'#ef4444'}}>{fap.imports.length-s} hardware</span></div>
+                      </div>
+                    );})()}
+                  </div>
+                )}
+                {tab==='imports'&&<div style={{maxHeight:mobile?280:500,overflowY:'auto'}}><ImportTable imports={fap.imports}/></div>}
+                {tab==='log'&&<LogPanel logs={logs}/>}
+              </div>
+            </div>
+          </>
+        )}
       </div>
-      <div
-        style={{
-          display:'flex',
-          gap:20,
-          flexWrap:'wrap'
-        }}
-      >
-        <div>
-          <FlipperScreen
-            canvasRef={canvasRef}
-            scale={scale}
-          />
-          <div style={{marginTop:20}}>
-            <DPad onInput={onDpad} />
-          </div>
+
+      {/* Phase 3: Legal footer */}
+      <footer style={{borderTop:'1px solid rgba(255,140,0,0.1)',padding:'10px 20px',display:'flex',gap:16,flexWrap:'wrap',alignItems:'center',justifyContent:'space-between'}}>
+        <div style={{fontSize:9,color:'rgba(255,255,255,0.2)',letterSpacing:'0.08em'}}>
+          <span style={{color:'rgba(255,140,0,0.4)'}}>FAP EMU</span>
+          {' · '}Not affiliated with Flipper Devices Inc.
+          {' · '}User is responsible for uploaded binaries
+          {' · '}Open source
         </div>
-        <div
-          style={{
-            flex:1,
-            minWidth:250,
-            background:'rgba(255,255,255,0.03)',
-            border:'1px solid rgba(255,255,255,0.08)',
-            borderRadius:6,
-            padding:12
-          }}
-        >
-          <div
-            style={{
-              marginBottom:10,
-              color:'#ff9900',
-              fontSize:12
-            }}
-          >
-            LOG OUTPUT
-          </div>
-          <div
-            style={{
-              height:300,
-              overflowY:'auto',
-              fontSize:12,
-              lineHeight:1.7
-            }}
-          >
-            {logs.map((l, i) => (
-              <div key={i}>{l}</div>
-            ))}
-          </div>
+        <div style={{fontSize:9,color:'rgba(255,255,255,0.15)'}}>
+          github.com/joelewis012/flipper-EMU
         </div>
-      </div>
+      </footer>
+
+      {zoomed&&<ZoomModal canvasRef={canvasRef} onClose={()=>setZoomed(false)}/>}
     </div>
   );
 }
-ReactDOM
-  .createRoot(
-    document.getElementById('root')
-  )
-  .render(<App />);
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
 </script>
 </body>
 </html>
