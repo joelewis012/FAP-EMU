@@ -83,7 +83,11 @@ function parseELF(buffer){
   const appName=strings.find(s=>/^[A-Z][A-Za-z0-9 \-_]{2,30}$/.test(s)&&s!==appId);
   const relSections=shdrs.filter(s=>s.name.startsWith('.rel'));
   const sections=shdrs.filter(s=>s.name&&s.name.length>0&&s.size>0);
-  return{fileName:'',fileSize:buffer.byteLength,buffer,eEntry,isDyn:view.getUint16(16,le)===3,sections,rawSections:shdrs,imports,relSections,appId,appName,textSize:sections.find(s=>s.name==='.text')?.size??0,rodataSize:rodata?.size??0,bssSize:sections.find(s=>s.name==='.bss')?.size??0,dataSize:sections.find(s=>s.name==='.data')?.size??0};
+  /* Parse program headers for correct VMA-based loading */
+  const ePhoff=view.getUint32(28,le),ePhentsize=view.getUint16(42,le)||32,ePhnum=view.getUint16(44,le);
+  const phdrs=[];
+  for(let i=0;i<ePhnum;i++){const o=ePhoff+i*ePhentsize;phdrs.push({type:view.getUint32(o,le),offset:view.getUint32(o+4,le),vaddr:view.getUint32(o+8,le),paddr:view.getUint32(o+12,le),filesz:view.getUint32(o+16,le),memsz:view.getUint32(o+20,le),flags:view.getUint32(o+24,le)});}
+  return{fileName:'',fileSize:buffer.byteLength,buffer,eEntry,isDyn:view.getUint16(16,le)===3,sections,rawSections:shdrs,phdrs,imports,relSections,appId,appName,textSize:sections.find(s=>s.name==='.text')?.size??0,rodataSize:rodata?.size??0,bssSize:sections.find(s=>s.name==='.bss')?.size??0,dataSize:sections.find(s=>s.name==='.data')?.size??0};
 }
 
 /* ── Display (Phase 3: icon rendering from XBM bitmap in memory) ──────── */
@@ -358,13 +362,39 @@ function loadFAP(uc,fap,stubs,log){
   const u8=new Uint8Array(fap.buffer),view=new DataView(fap.buffer),le=true;
   const rs=(o,max=64)=>{let s='';for(let i=0;i<max;i++){const c=u8[o+i];if(!c)break;s+=String.fromCharCode(c);}return s;};
   const w32=(addr,val)=>{const b=new Uint8Array(4);new DataView(b.buffer).setUint32(0,val,le);uc.mem_write(addr,b);};
-  uc.mem_map(LOAD_BASE,2*1024*1024,7);uc.mem_map(RAM_BASE,2*1024*1024,6);uc.mem_map(STUB_BASE,1*1024*1024,7);
+  uc.mem_map(LOAD_BASE,4*1024*1024,7);uc.mem_map(RAM_BASE,1*1024*1024,6);uc.mem_map(STUB_BASE,1*1024*1024,7);
+  /* Map a null page so unresolved calls to address 0 return gracefully */
+  try{uc.mem_map(0,4096,5);const nop=new Uint8Array(4096);for(let i=0;i<2048;i++){nop[i*2]=0x70;nop[i*2+1]=0x47;}uc.mem_write(0,nop);}catch(e){}
   const sc=new Uint8Array(1024*4);for(let i=0;i<1024;i++){sc[i*4]=0x70;sc[i*4+1]=0x47;}uc.mem_write(STUB_BASE,sc);
   const sec=n=>fap.rawSections.find(s=>s.name===n);
-  const textSec=sec('.text');const baseVA=textSec?.addr??LOAD_BASE;const delta=LOAD_BASE-baseVA;
-  const ls=s=>{if(!s||!s.size)return;const dst=s.addr+delta;uc.mem_write(dst,u8.slice(s.offset,s.offset+s.size));log(`[LOAD] ${s.name} @ 0x${dst.toString(16)} (${s.size}B)`);};
-  ls(textSec);ls(sec('.rodata'));ls(sec('.data'));ls(sec('.got'));ls(sec('.got.plt'));
-  const bss=sec('.bss');if(bss)try{uc.mem_write(bss.addr+delta,new Uint8Array(bss.size));}catch(e){}
+  const hasPhdrs=fap.phdrs&&fap.phdrs.some(p=>p.type===1);
+  let delta=0;
+  if(hasPhdrs){
+    /* PHDR-based loading — sections land at correct VMAs */
+    log('[LOAD] Using program headers');
+    for(const ph of fap.phdrs){
+      if(ph.type!==1)continue;
+      if(ph.filesz>0){try{uc.mem_write(ph.vaddr,u8.slice(ph.offset,ph.offset+ph.filesz));log(`[LOAD] PHDR @ 0x${ph.vaddr.toString(16)} (${ph.filesz}B)`);}catch(e){log(`[LOAD] PHDR err: ${e?.message??String(e)}`);}}
+      if(ph.memsz>ph.filesz){try{uc.mem_write(ph.vaddr+ph.filesz,new Uint8Array(ph.memsz-ph.filesz));}catch(e){}}
+    }
+  } else {
+    /* Section-based fallback — guard against .data overwriting .text */
+    const textSec=sec('.text');const baseVA=textSec?.addr??0;delta=LOAD_BASE-baseVA;
+    const textEnd=LOAD_BASE+(textSec?.size??0);
+    const ls=s=>{
+      if(!s||!s.size)return;
+      const dst=s.addr+delta;
+      /* If a writable section would land inside the code area, redirect it to RAM */
+      const isWritable=(s.flags&1)!==0;
+      const overlapsText=dst>=LOAD_BASE&&dst<textEnd;
+      const target=(isWritable&&overlapsText)?RAM_BASE+(dst-LOAD_BASE):dst;
+      if(isWritable&&overlapsText)log(`[LOAD] ${s.name} redirected from 0x${dst.toString(16)} to RAM 0x${target.toString(16)} (${s.size}B)`);
+      else log(`[LOAD] ${s.name} @ 0x${dst.toString(16)} (${s.size}B)`);
+      try{uc.mem_write(target,u8.slice(s.offset,s.offset+s.size));}catch(e){log(`[LOAD] err: ${e?.message??String(e)}`);}
+    };
+    ls(textSec);ls(sec('.rodata'));ls(sec('.data'));ls(sec('.got'));ls(sec('.got.plt'));
+    const bss=sec('.bss');if(bss){const dst=bss.addr+delta;const isW=(bss.flags&1)!==0;const t=(isW&&dst>=LOAD_BASE&&dst<textEnd)?RAM_BASE+(dst-LOAD_BASE):dst;try{uc.mem_write(t,new Uint8Array(bss.size));}catch(e){}}
+  }
   for(const rel of fap.relSections){
     const hasA=rel.name.startsWith('.rela'),ent=hasA?12:8,cnt=Math.floor(rel.size/ent);
     /* Use the rel section's link field to find its symbol table, then that symtab's link for the string table */
@@ -380,7 +410,7 @@ function loadFAP(uc,fap,stubs,log){
     }
   }
   uc.reg_write(RP.SP,STACK_TOP);uc.reg_write(RP.LR,0xFEFEFEFE);
-  const entry=(fap.eEntry+delta)|1;log(`[EMU] Entry: 0x${entry.toString(16)}`);return entry;
+  const entry=hasPhdrs?(fap.eEntry|1):((fap.eEntry+delta)|1);log(`[EMU] Entry: 0x${entry.toString(16)}`);return entry;
 }
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
@@ -553,15 +583,15 @@ function App(){
       },STUB_BASE,STUB_BASE+0x100000);
       const entry=loadFAP(uc,fap,stubs,addLog);
       addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
-      try{uc.emu_start(entry,0xFEFEFEFE,0,2000000);}catch(e){addLog(`[EMU] init: ${e.message}`);}
+      try{uc.emu_start(entry,0xFEFEFEFE,0,2000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
       renderDisplay();
       const tick=()=>{
         if(emuStateRef.current!=='running'){loopRef.current=null;return;}
-        try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,5000);renderDisplay();}catch(e){}
+        try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,5000);renderDisplay();}catch(e){if(emuStateRef.current==='running')addLog(`[ERR] tick: ${e?.message??String(e)}`);}
         loopRef.current=requestAnimationFrame(tick);
       };
       loopRef.current=requestAnimationFrame(tick);
-    }catch(e){if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}addLog(`[ERR] ${e.message}`);setEmuState('error');emuStateRef.current='error';}
+    }catch(e){if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}addLog(`[ERR] ${e?.message??String(e)}`);setEmuState('error');emuStateRef.current='error';}
   },[fap,ucReady,addLog,renderDisplay]);
 
   const stopFAP=()=>{
