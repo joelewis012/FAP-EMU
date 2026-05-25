@@ -687,6 +687,8 @@ function App(){
           if(inputQueue.current.length>0){waitingInputRef.current=false;try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,50000);renderDisplay();}catch(e){}}
           else renderDisplay();
         }
+        loopRef.current=requestAnimationFrame(tick);
+      };
       loopRef.current=requestAnimationFrame(tick);
     }catch(e){if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}addLog(`[ERR] ${e?.message??String(e)}`);setEmuState('error');emuStateRef.current='error';}
   },[fap,ucReady,addLog,renderDisplay]);
