@@ -26,6 +26,7 @@ const GB_ON=[15,56,15],GB_OFF=[155,188,15];
 const LOAD_BASE=0x08000000,RAM_BASE=0x20000000;
 const HEAP_BASE=0x20010000,STACK_TOP=0x20030000,STUB_BASE=0x40000000;
 const RP={R0:66,R1:67,R2:68,R3:69,SP:71,LR:72,PC:73};
+const CANVAS_FAKE=0x20001000;
 const EM_ARM=40,SHN_UNDEF=0;
 const InputKey={Up:0,Down:1,Left:2,Right:3,Ok:4,Back:5};
 const InputType={Press:0,Release:1,Short:2};
@@ -80,7 +81,7 @@ function parseELF(buffer){
   /* Also extract DEFINED SDK function addresses for static binary interception */
   const SDK_FNS=new Set(['canvas_commit','canvas_clear','canvas_set_font','canvas_set_color','canvas_draw_str','canvas_draw_str_aligned','canvas_draw_dot','canvas_draw_line','canvas_draw_frame','canvas_draw_box','canvas_draw_circle','canvas_draw_disc','canvas_draw_icon','canvas_draw_xbm','canvas_width','canvas_height','view_port_alloc','view_port_free','view_port_enabled_set','view_port_draw_callback_set','view_port_input_callback_set','view_port_update','gui_add_view_port','gui_remove_view_port','furi_delay_ms','furi_delay_tick','furi_thread_yield','furi_record_open','furi_record_close','malloc','free','calloc','realloc','furi_message_queue_alloc','furi_message_queue_put','furi_message_queue_get','furi_message_queue_free','furi_semaphore_alloc','furi_semaphore_acquire','furi_semaphore_release','furi_semaphore_free','furi_mutex_alloc','furi_mutex_acquire','furi_mutex_release','furi_mutex_free']);
   const definedFns={};
-  if(symtab&&strtab){const ent=symtab.entsize||16,cnt=Math.floor(symtab.size/ent);for(let i=1;i<cnt;i++){const o=symtab.offset+i*ent,ni=view.getUint32(o,le),val=view.getUint32(o+4,le),info=u8[o+12],shndx=view.getUint16(o+14,le),name=rs(strtab.offset+ni);if(shndx!==SHN_UNDEF&&shndx!==0xFFFF&&val>0&&(info&0xf)===2&&SDK_FNS.has(name))definedFns[name]=val;}}
+  if(symtab&&strtab){const ent=symtab.entsize||16,cnt=Math.floor(symtab.size/ent);for(let i=1;i<cnt;i++){const o=symtab.offset+i*ent,ni=view.getUint32(o,le),val=view.getUint32(o+4,le),info=u8[o+12],shndx=view.getUint16(o+14,le),name=rs(strtab.offset+ni);if(shndx!==SHN_UNDEF&&shndx!==0xFFFF&&val>0&&(info&0xf)<=2&&SDK_FNS.has(name))definedFns[name]=val;}}
   const rodata=shdrs.find(s=>s.name==='.rodata');
   const strings=[];if(rodata){let cur='';for(let i=0;i<rodata.size;i++){const c=u8[rodata.offset+i];if(c===0&&cur.length>=3){strings.push(cur);cur='';}else if(c>=32&&c<127)cur+=String.fromCharCode(c);else cur='';}}
   const appId=strings.find(s=>/^[a-z][a-z0-9_]{2,24}$/.test(s)&&!['text','data','bss','got','plt'].includes(s));
@@ -144,7 +145,7 @@ class FlipperDisplay{
 }
 
 /* ── Stubs (Phase 3: ViewDispatcher, View, SceneManager, Widgets) ──────── */
-function buildStubs(display,inputQueueRef,logFn){
+function buildStubs(display,inputQueueRef,logFn,cb={}){const{onDraw,onWaitInput}=cb;
   const stubs={},handlers={};let nextAddr=STUB_BASE;
   const log=logFn||(()=>{});
   function reg(name,fn){stubs[name]=nextAddr;handlers[nextAddr]=fn;nextAddr+=4;}
@@ -185,11 +186,11 @@ function buildStubs(display,inputQueueRef,logFn){
   reg('view_port_enabled_set',        ()=>{});
   reg('view_port_draw_callback_set',  (uc)=>{vpDraw=rr(uc,1);vpCtx=rr(uc,2);log(`[VP] draw_cb=0x${rr(uc,1).toString(16)}`);});
   reg('view_port_input_callback_set', (uc)=>{vpInput=rr(uc,1);log(`[VP] input_cb=0x${rr(uc,1).toString(16)}`);});
-  reg('view_port_update',             ()=>{});
+  reg('view_port_update',             ()=>{onDraw?.();});
   stubs._getVPDraw=()=>vpDraw;stubs._getVPInput=()=>vpInput;stubs._getVPCtx=()=>vpCtx;
 
   /* GUI */
-  reg('gui_add_view_port',         ()=>log('[GUI] viewport added'));
+  reg('gui_add_view_port',         ()=>{log('[GUI] viewport added');onDraw?.();});
   reg('gui_remove_view_port',      ()=>{});
   reg('gui_get_framebuffer_size',  ()=>1024);
 
@@ -199,7 +200,7 @@ function buildStubs(display,inputQueueRef,logFn){
   reg('view_dispatcher_free',                         ()=>{});
   reg('view_dispatcher_enable_queue',                 ()=>{});
   reg('view_dispatcher_attach_to_gui',                ()=>log('[VD] attached to GUI'));
-  reg('view_dispatcher_run',                          ()=>log('[VD] run() — event loop started'));
+  reg('view_dispatcher_run',                          ()=>{log('[VD] run() — event loop, triggering draw');onDraw?.();});
   reg('view_dispatcher_stop',                         ()=>{});
   reg('view_dispatcher_add_view',                     ()=>{});
   reg('view_dispatcher_remove_view',                  ()=>{});
@@ -302,6 +303,10 @@ function buildStubs(display,inputQueueRef,logFn){
   reg('menu_free',      ()=>{});
   reg('menu_get_view',  (uc)=>mm(uc,64));
 
+  /* Furi records */
+  reg('furi_record_open', (uc)=>{const name=rs(uc,rr(uc,0));log(`[FURI] record_open("${name}")`);return 0x20000200;});
+  reg('furi_record_close',()=>{});
+
   /* Memory */
   reg('malloc',    (uc)=>mm(uc,rr(uc,0)));
   reg('calloc',    (uc)=>mm(uc,rr(uc,0)*rr(uc,1)));
@@ -337,7 +342,7 @@ function buildStubs(display,inputQueueRef,logFn){
   reg('furi_message_queue_alloc',(uc)=>mm(uc,64));
   reg('furi_message_queue_free',()=>{});
   reg('furi_message_queue_put',()=>0);
-  reg('furi_message_queue_get',(uc)=>{const q=inputQueueRef.current;if(q.length>0){const evt=q.shift();const buf=rr(uc,1);if(buf)w32(uc,buf,evt.key|(evt.type<<8));return 0;}return 5;});
+  reg('furi_message_queue_get',(uc)=>{const q=inputQueueRef.current;if(q.length>0){const evt=q.shift();const buf=rr(uc,1);if(buf)w32(uc,buf,evt.key|(evt.type<<8));onDraw?.();return 0;}onWaitInput?.(uc);return 5;});
 
   /* Thread */
   reg('furi_thread_alloc',(uc)=>mm(uc,64)); reg('furi_thread_free',()=>{});
@@ -529,6 +534,8 @@ function App(){
   const loopRef     =useRef(null);
   const emuStateRef =useRef('idle');
   const watchdogRef =useRef(null);
+  const pendingDrawRef=useRef(false);
+  const waitingInputRef=useRef(false);
 
   const winW=useWindowWidth();
   const mobile=winW<600,tablet=winW<960;
@@ -565,20 +572,18 @@ function App(){
 
   const runFAP=useCallback(async()=>{
     if(!fap||!ucReady||!window.uc){addLog('[ERR] Unicorn.js not ready');return;}
-    if(fap.imports.length===0){
-      addLog('[ERR] No stubbable imports found — cannot emulate this binary.');
-      setError('No SDK imports detected — this .fap has no Flipper SDK calls FAP EMU can stub. It may be stripped or use a custom runtime.');
-      return;
+    if(fap.imports.length===0&&Object.keys(fap.definedFns||{}).length===0){
+      addLog('[WARN] No SDK symbols found — binary may be fully stripped. Attempting anyway...');
     }
     setEmuState('running');emuStateRef.current='running';
     setLogs([]);displayRef.current.clear();renderDisplay();
     let commitSeen=false;
     watchdogRef.current=setTimeout(()=>{
       if(emuStateRef.current==='running'&&!commitSeen){
-        addLog('[WARN] No display output after 5s.');
-        addLog('[WARN] Static binaries call hardware drivers directly — canvas output cannot be intercepted.');
-        addLog('[WARN] Try a newer .fap from lab.flipper.net for dynamic linking support.');
-        setError('No display output after 5s. Static binaries drive the LCD directly via hardware — try a newer .fap from lab.flipper.net.');
+        addLog('[WARN] No display output after 5s — try pressing OK or UP to trigger a draw callback.');
+        addLog('[WARN] If your app uses ViewPort, make sure draw callback is registered before the event loop.');
+        addLog('[WARN] Check the LOG tab for [DRAW] entries showing when draw callbacks were triggered.');
+        setError('No display output after 5s. Check the LOG for [DRAW] entries. If no draw callback was registered, the app may require RTOS features.');
       }
       watchdogRef.current=null;
     },5000);
@@ -586,7 +591,11 @@ function App(){
     try{
       const uc=new window.uc.Unicorn(window.uc.ARCH_ARM,window.uc.MODE_THUMB);
       ucRef.current=uc;
-      const{stubs,handlers}=buildStubs(displayRef.current,inputQueue,addLog);
+      pendingDrawRef.current=false;waitingInputRef.current=false;
+      const{stubs,handlers}=buildStubs(displayRef.current,inputQueue,addLog,{
+        onDraw:()=>{pendingDrawRef.current=true;},
+        onWaitInput:(uc_h)=>{waitingInputRef.current=true;pendingDrawRef.current=true;uc_h.emu_stop();}
+      });
       uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
         const h=handlers[addr];
         if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e?.message??String(e)}`);ret=0;}if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);const lr=uc_h.reg_read(RP.LR)>>>0;uc_h.reg_write(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
@@ -614,8 +623,8 @@ function App(){
           if(!commitSeen){
             addLog('[WARN] App exited without drawing anything.');
             addLog('[WARN] Static binaries require full Flipper OS simulation — canvas calls go to hardware, not our stubs.');
-            addLog('[WARN] Try a .fap from lab.flipper.net (newer apps are smaller and use dynamic linking).');
-            setError('Static binary exited without drawing. These apps need the full Flipper OS to run. Try a newer .fap from lab.flipper.net.');
+            addLog('[WARN] Make sure your app calls view_port_draw_callback_set before gui_add_view_port.');
+            setError('App exited without drawing. SDK stubs returned no-ops — try pressing OK/UP after RUN to trigger input-driven draws.');
           } else {
             addLog('[EMU] App exited normally.');
           }
@@ -655,15 +664,29 @@ function App(){
           },addr,addr);
         }
       }
+      /* triggerDraw: call the registered draw callback with a fake canvas */
+      const triggerDraw=()=>{
+        const cb=stubs._getVPDraw(),ctx=stubs._getVPCtx();
+        if(!cb){addLog('[DRAW] no draw callback registered yet');return;}
+        const sv=[[RP.R0,RP.R1,RP.R2,RP.R3,RP.LR,RP.PC,RP.SP].map(r=>[r,uc.reg_read(r)>>>0])];
+        uc.reg_write(RP.R0,CANVAS_FAKE);uc.reg_write(RP.R1,ctx>>>0);uc.reg_write(RP.LR,0xFEFEFEFE);
+        addLog(`[DRAW] calling draw_cb @ 0x${cb.toString(16)}`);
+        try{uc.emu_start(cb|1,0xFEFEFEFE,0,1000000);commitSeen=true;renderDisplay();}catch(e){addLog(`[DRAW] err: ${e?.message??String(e)}`);}
+        sv[0].forEach(([r,v])=>uc.reg_write(r,v));
+      };
       const entry=loadFAP(uc,fap,stubs,addLog);
       addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
       try{uc.emu_start(entry,0xFEFEFEFE,0,2000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
       renderDisplay();
       const tick=()=>{
         if(emuStateRef.current!=='running'){loopRef.current=null;return;}
-        try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,5000);renderDisplay();}catch(e){if(emuStateRef.current==='running')addLog(`[ERR] tick: ${e?.message??String(e)}`);}
-        loopRef.current=requestAnimationFrame(tick);
-      };
+        if(pendingDrawRef.current){pendingDrawRef.current=false;triggerDraw();}
+        if(!waitingInputRef.current){
+          try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,5000);renderDisplay();}catch(e){if(emuStateRef.current==='running')addLog(`[ERR] tick: ${e?.message??String(e)}`);}
+        }else{
+          if(inputQueue.current.length>0){waitingInputRef.current=false;try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,50000);renderDisplay();}catch(e){}}
+          else renderDisplay();
+        }
       loopRef.current=requestAnimationFrame(tick);
     }catch(e){if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}addLog(`[ERR] ${e?.message??String(e)}`);setEmuState('error');emuStateRef.current='error';}
   },[fap,ucReady,addLog,renderDisplay]);
