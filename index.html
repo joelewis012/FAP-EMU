@@ -586,8 +586,24 @@ function App(){
         if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e?.message??String(e)}`);ret=0;}if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);const lr=uc_h.reg_read(RP.LR)>>>0;uc_h.reg_write(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
         if((uc_h.reg_read(RP.PC)>>>0)===0xFEFEFEFE)uc_h.emu_stop();
       },STUB_BASE,STUB_BASE+0x100000);
-      /* EXC_RETURN hook — intercept Cortex-M exception returns (0xFFFFFFF*) and stop cleanly */
-      try{uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{uc_h.emu_stop();addLog('[EMU] EXC_RETURN — app exited via exception return');},0xFFFF0000,0xFFFFFFFF);}catch(e){}
+      /* HOOK_INTR — log software interrupts (SVC etc) */
+      try{uc.hook_add(window.uc.HOOK_INTR,(uc_h,intno)=>{addLog(`[INT] interrupt #${intno}`);});}catch(e){}
+      /* EXC_RETURN hook — simulate Cortex-M exception return by popping the hardware frame */
+      try{uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
+        /* Read 4 bytes from emulated memory */
+        const r32=(a)=>{const b=new ArrayBuffer(4);try{uc_h.mem_read(a>>>0,b);}catch(e){}return new DataView(b).getUint32(0,true);};
+        const sp=(uc_h.reg_read(RP.SP)>>>0);
+        /* Cortex-M exception frame: R0,R1,R2,R3,R12,LR,PC,xPSR at SP..SP+31 */
+        const retR0=r32(sp),retR1=r32(sp+4),retR2=r32(sp+8),retR3=r32(sp+12);
+        const retR12=r32(sp+16),retLR=r32(sp+20),retPC=r32(sp+24);
+        uc_h.reg_write(RP.SP,(sp+32)>>>0);
+        uc_h.reg_write(RP.R0,retR0>>>0);uc_h.reg_write(RP.R1,retR1>>>0);
+        uc_h.reg_write(RP.R2,retR2>>>0);uc_h.reg_write(RP.R3,retR3>>>0);
+        uc_h.reg_write(RP.LR,retLR>>>0);
+        const dst=(retPC>>>0);
+        if(dst===0xFEFEFEFE||dst===0){addLog('[EMU] app returned normally');uc_h.emu_stop();}
+        else{uc_h.reg_write(RP.PC,(dst|1)>>>0);}  // resume in THUMB mode
+      },0xFFFF0000,0xFFFFFFFF);}catch(e){addLog(`[EXC] hook err: ${e?.message??String(e)}`);}
       /* Demand-paging hook: map any unmapped region on access so startup writes don't crash */
       const MEM_INVALID=(window.uc.HOOK_MEM_READ_UNMAPPED??16)|(window.uc.HOOK_MEM_WRITE_UNMAPPED??32)|(window.uc.HOOK_MEM_FETCH_UNMAPPED??64);
       let dynMaps=0;
