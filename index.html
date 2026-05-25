@@ -77,6 +77,10 @@ function parseELF(buffer){
   const parseSym=(symSec,strSec)=>{const ent=symSec.entsize||16,cnt=Math.floor(symSec.size/ent);for(let i=1;i<cnt;i++){const o=symSec.offset+i*ent,ni=view.getUint32(o,le),val=view.getUint32(o+4,le),info=u8[o+12],shndx=view.getUint16(o+14,le),name=rs(strSec.offset+ni);if(shndx===SHN_UNDEF&&name.length>0&&!imports.find(x=>x.name===name))imports.push({name,value:val,binding:info>>4,type:info&0xf});}};
   if(dynsym&&dynstr)parseSym(dynsym,dynstr);
   if(symtab&&strtab)parseSym(symtab,strtab);
+  /* Also extract DEFINED SDK function addresses for static binary interception */
+  const SDK_FNS=new Set(['canvas_commit','canvas_clear','canvas_set_font','canvas_set_color','canvas_draw_str','canvas_draw_str_aligned','canvas_draw_dot','canvas_draw_line','canvas_draw_frame','canvas_draw_box','canvas_draw_circle','canvas_draw_disc','canvas_draw_icon','canvas_draw_xbm','canvas_width','canvas_height','view_port_alloc','view_port_free','view_port_enabled_set','view_port_draw_callback_set','view_port_input_callback_set','view_port_update','gui_add_view_port','gui_remove_view_port','furi_delay_ms','furi_delay_tick','furi_thread_yield','furi_record_open','furi_record_close','malloc','free','calloc','realloc','furi_message_queue_alloc','furi_message_queue_put','furi_message_queue_get','furi_message_queue_free','furi_semaphore_alloc','furi_semaphore_acquire','furi_semaphore_release','furi_semaphore_free','furi_mutex_alloc','furi_mutex_acquire','furi_mutex_release','furi_mutex_free']);
+  const definedFns={};
+  if(symtab&&strtab){const ent=symtab.entsize||16,cnt=Math.floor(symtab.size/ent);for(let i=1;i<cnt;i++){const o=symtab.offset+i*ent,ni=view.getUint32(o,le),val=view.getUint32(o+4,le),info=u8[o+12],shndx=view.getUint16(o+14,le),name=rs(strtab.offset+ni);if(shndx!==SHN_UNDEF&&shndx!==0xFFFF&&val>0&&(info&0xf)===2&&SDK_FNS.has(name))definedFns[name]=val;}}
   const rodata=shdrs.find(s=>s.name==='.rodata');
   const strings=[];if(rodata){let cur='';for(let i=0;i<rodata.size;i++){const c=u8[rodata.offset+i];if(c===0&&cur.length>=3){strings.push(cur);cur='';}else if(c>=32&&c<127)cur+=String.fromCharCode(c);else cur='';}}
   const appId=strings.find(s=>/^[a-z][a-z0-9_]{2,24}$/.test(s)&&!['text','data','bss','got','plt'].includes(s));
@@ -87,7 +91,7 @@ function parseELF(buffer){
   const ePhoff=view.getUint32(28,le),ePhentsize=view.getUint16(42,le)||32,ePhnum=view.getUint16(44,le);
   const phdrs=[];
   for(let i=0;i<ePhnum;i++){const o=ePhoff+i*ePhentsize;phdrs.push({type:view.getUint32(o,le),offset:view.getUint32(o+4,le),vaddr:view.getUint32(o+8,le),paddr:view.getUint32(o+12,le),filesz:view.getUint32(o+16,le),memsz:view.getUint32(o+20,le),flags:view.getUint32(o+24,le)});}
-  return{fileName:'',fileSize:buffer.byteLength,buffer,eEntry,isDyn:view.getUint16(16,le)===3,sections,rawSections:shdrs,phdrs,imports,relSections,appId,appName,textSize:sections.find(s=>s.name==='.text')?.size??0,rodataSize:rodata?.size??0,bssSize:sections.find(s=>s.name==='.bss')?.size??0,dataSize:sections.find(s=>s.name==='.data')?.size??0};
+  return{fileName:'',fileSize:buffer.byteLength,buffer,eEntry,isDyn:view.getUint16(16,le)===3,sections,rawSections:shdrs,phdrs,imports,definedFns,relSections,appId,appName,textSize:sections.find(s=>s.name==='.text')?.size??0,rodataSize:rodata?.size??0,bssSize:sections.find(s=>s.name==='.bss')?.size??0,dataSize:sections.find(s=>s.name==='.data')?.size??0};
 }
 
 /* ── Display (Phase 3: icon rendering from XBM bitmap in memory) ──────── */
@@ -571,8 +575,10 @@ function App(){
     let commitSeen=false;
     watchdogRef.current=setTimeout(()=>{
       if(emuStateRef.current==='running'&&!commitSeen){
-        addLog('[WARN] Watchdog: no canvas_commit after 5s — app may be stuck or incompatible.');
-        addLog('[WARN] Try pressing OK or UP to trigger a draw callback.');
+        addLog('[WARN] No display output after 5s.');
+        addLog('[WARN] Static binaries call hardware drivers directly — canvas output cannot be intercepted.');
+        addLog('[WARN] Try a newer .fap from lab.flipper.net for dynamic linking support.');
+        setError('No display output after 5s. Static binaries drive the LCD directly via hardware — try a newer .fap from lab.flipper.net.');
       }
       watchdogRef.current=null;
     },5000);
@@ -601,7 +607,20 @@ function App(){
         uc_h.reg_write(RP.R2,retR2>>>0);uc_h.reg_write(RP.R3,retR3>>>0);
         uc_h.reg_write(RP.LR,retLR>>>0);
         const dst=(retPC>>>0);
-        if(dst===0xFEFEFEFE||dst===0){addLog('[EMU] app returned normally');uc_h.emu_stop();}
+        if(dst===0xFEFEFEFE||dst===0){
+          uc_h.emu_stop();
+          emuStateRef.current='idle';
+          if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}
+          if(!commitSeen){
+            addLog('[WARN] App exited without drawing anything.');
+            addLog('[WARN] Static binaries require full Flipper OS simulation — canvas calls go to hardware, not our stubs.');
+            addLog('[WARN] Try a .fap from lab.flipper.net (newer apps are smaller and use dynamic linking).');
+            setError('Static binary exited without drawing. These apps need the full Flipper OS to run. Try a newer .fap from lab.flipper.net.');
+          } else {
+            addLog('[EMU] App exited normally.');
+          }
+          setEmuState('idle');
+        }
         else{uc_h.reg_write(RP.PC,(dst|1)>>>0);}  // resume in THUMB mode
       },0xFFFF0000,0xFFFFFFFF);}catch(e){addLog(`[EXC] hook err: ${e?.message??String(e)}`);}
       /* Demand-paging hook: map any unmapped region on access so startup writes don't crash */
@@ -617,6 +636,25 @@ function App(){
         if(dynMaps<16){addLog(`[MEM] dyn-map 64KB @ 0x${page.toString(16)} (access 0x${(addr>>>0).toString(16)})`);dynMaps++;}
         return true;
       },1,0xFFFFFFFF);}catch(e){addLog(`[MEM] hook unavailable: ${e?.message??String(e)}`);}
+      /* Static binary: hook known SDK functions at their actual addresses */
+      const staticFns=fap.definedFns||{};
+      const staticCount=Object.keys(staticFns).length;
+      if(staticCount>0){
+        addLog(`[EMU] Intercepting ${staticCount} SDK functions in static binary`);
+        for(const[name,addr]of Object.entries(staticFns)){
+          const stubAddr=stubs[name];
+          if(stubAddr===undefined)continue;
+          const handler=handlers[stubAddr];
+          if(!handler)continue;
+          uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
+            let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
+            if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
+            if(name==='canvas_commit'){commitSeen=true;renderDisplay();}
+            const lr=(uc_h.reg_read(RP.LR)>>>0)&~1;
+            uc_h.reg_write(RP.PC,lr?lr:0xFEFEFEFE);
+          },addr,addr);
+        }
+      }
       const entry=loadFAP(uc,fap,stubs,addLog);
       addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
       try{uc.emu_start(entry,0xFEFEFEFE,0,2000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
