@@ -566,7 +566,20 @@ function App(){
     setError(null);setFap(null);setEmuState('idle');emuStateRef.current='idle';setLogs([]);
     displayRef.current.clear();renderDisplay();
     const reader=new FileReader();
-    reader.onload=e=>{try{const r=parseELF(e.target.result);setFap({...r,fileName:file.name});}catch(err){setError(err.message);}};
+    reader.onload=e=>{try{
+      const r=parseELF(e.target.result);
+      setFap({...r,fileName:file.name});
+      /* Diagnostic: log all sections and defined symbols */
+      const diagLogs=[];
+      diagLogs.push(`[ELF] type=${r.isDyn?'ET_DYN':'ET_EXEC'} entry=0x${r.eEntry.toString(16)} sections=${r.rawSections.length} phdrs=${r.phdrs?.length??0}`);
+      r.rawSections.filter(s=>s.name&&s.size>0).forEach(s=>diagLogs.push(`[SEC] ${s.name} size=${s.size} addr=0x${s.addr.toString(16)} type=${s.type} flags=${s.flags}`));
+      const defFns=Object.entries(r.definedFns||{});
+      if(defFns.length>0)defFns.forEach(([n,a])=>diagLogs.push(`[SYM] defined: ${n} @ 0x${a.toString(16)}`));
+      else diagLogs.push('[SYM] No interceptable SDK symbols found as defined functions');
+      diagLogs.push(`[SYM] ${r.imports.length} undefined imports, ${r.relSections.length} rel sections`);
+      setLogs(diagLogs);
+    }catch(err){setError(err.message);}};
+
     reader.readAsArrayBuffer(file);
   },[renderDisplay]);
 
