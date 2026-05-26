@@ -303,6 +303,35 @@ function buildStubs(display,inputQueueRef,logFn,cb={}){const{onDraw,onWaitInput}
   reg('menu_free',      ()=>{});
   reg('menu_get_view',  (uc)=>mm(uc,64));
 
+  /* ARM AEABI double-precision helpers — doubles passed as R0:R1 (a) and R2:R3 (b) */
+  {
+    const rdbl=(uc,r1,r2)=>{const b=new ArrayBuffer(8),dv=new DataView(b);dv.setUint32(0,uc.reg_read(r1)>>>0,true);dv.setUint32(4,uc.reg_read(r2)>>>0,true);return dv.getFloat64(0,true);};
+    const wdbl=(uc,r1,r2,v)=>{const b=new ArrayBuffer(8),dv=new DataView(b);dv.setFloat64(0,isNaN(v)?NaN:v,true);uc.reg_write(r1,dv.getUint32(0,true)>>>0);uc.reg_write(r2,dv.getUint32(4,true)>>>0);};
+    const ra=(uc)=>rdbl(uc,RP.R0,RP.R1),rb=(uc)=>rdbl(uc,RP.R2,RP.R3);
+    const wa=(uc,v)=>wdbl(uc,RP.R0,RP.R1,v);
+    reg('__aeabi_dadd',(uc)=>{wa(uc,ra(uc)+rb(uc));});
+    reg('__aeabi_dsub',(uc)=>{wa(uc,ra(uc)-rb(uc));});
+    reg('__aeabi_dmul',(uc)=>{wa(uc,ra(uc)*rb(uc));});
+    reg('__aeabi_ddiv',(uc)=>{wa(uc,ra(uc)/rb(uc));});
+    reg('__aeabi_dcmplt',(uc)=>ra(uc)<rb(uc)?1:0);
+    reg('__aeabi_dcmpgt',(uc)=>ra(uc)>rb(uc)?1:0);
+    reg('__aeabi_dcmpeq',(uc)=>ra(uc)===rb(uc)?1:0);
+    reg('__aeabi_dcmple',(uc)=>ra(uc)<=rb(uc)?1:0);
+    reg('__aeabi_dcmpge',(uc)=>ra(uc)>=rb(uc)?1:0);
+    reg('__aeabi_dcmpun',(uc)=>(isNaN(ra(uc))||isNaN(rb(uc)))?1:0);
+    reg('__aeabi_cdcmple',(uc)=>ra(uc)<=rb(uc)?0:1);
+    reg('__aeabi_cdrcmple',(uc)=>rb(uc)<=ra(uc)?0:1);
+    reg('__cmpdf2',(uc)=>{const a=ra(uc),b=rb(uc);return a<b?-1:a>b?1:0;});
+    reg('__aeabi_i2d',(uc)=>{wa(uc,(rr(uc,0)|0));});
+    reg('__aeabi_d2i',(uc)=>Math.trunc(ra(uc))|0);
+    reg('__ieee754_pow',(uc)=>{wa(uc,Math.pow(ra(uc),rb(uc)));});
+    reg('fabs',(uc)=>{wa(uc,Math.abs(ra(uc)));});
+    reg('finite',(uc)=>isFinite(ra(uc))?1:0);
+    reg('scalbn',(uc)=>{wa(uc,ra(uc)*Math.pow(2,rr(uc,2)|0));});
+    const ERRNO_ADDR=0x20000010;
+    reg('__errno',()=>ERRNO_ADDR);
+  }
+
   /* Furi records */
   reg('furi_record_open', (uc)=>{const name=rs(uc,rr(uc,0));log(`[FURI] record_open("${name}")`);return 0x20000200;});
   reg('furi_record_close',()=>{});
@@ -581,6 +610,17 @@ function App(){
       if(defFns.length>0)defFns.forEach(([n,a])=>diagLogs.push(`[SYM] defined: ${n} @ 0x${a.toString(16)}`));
       else diagLogs.push('[SYM] No interceptable SDK symbols found as defined functions');
       diagLogs.push(`[SYM] ${r.imports.length} undefined imports, ${r.relSections.length} rel sections`);
+      /* Dump first 64 bytes of .fast.rel.text for format analysis */
+      const fastRel=r.rawSections.find(s=>s.name==='.fast.rel.text');
+      if(fastRel){
+        const u8=new Uint8Array(r.buffer,fastRel.offset,Math.min(fastRel.size,64));
+        const hex=Array.from(u8).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+        diagLogs.push(`[FAST] .fast.rel.text size=${fastRel.size} first 64B: ${hex}`);
+        /* Try parsing as {uint32 count, then count×{uint32 offset, uint32 hash, uint8 flags}} */
+        const dv=new DataView(r.buffer,fastRel.offset,fastRel.size);
+        const cnt=dv.getUint32(0,true);
+        diagLogs.push(`[FAST] count=${cnt} (${fastRel.size-4}/${cnt}=${((fastRel.size-4)/cnt).toFixed(2)} bytes/entry)`);
+      }
       setLogs(diagLogs);
     }catch(err){setError(err.message);}};
 
@@ -662,24 +702,28 @@ function App(){
         if(dynMaps<16){addLog(`[MEM] dyn-map 64KB @ 0x${page.toString(16)} (access 0x${(addr>>>0).toString(16)})`);dynMaps++;}
         return true;
       },1,0xFFFFFFFF);}catch(e){addLog(`[MEM] hook unavailable: ${e?.message??String(e)}`);}
-      /* Static binary: hook known SDK functions at their actual addresses */
+      /* Static binary: definedFns — merged into csMap above if callSites hook exists,
+         otherwise add a separate range hook */
       const staticFns=fap.definedFns||{};
       const staticCount=Object.keys(staticFns).length;
-      if(staticCount>0){
-        addLog(`[EMU] Intercepting ${staticCount} SDK functions in static binary`);
+      if(staticCount>0&&callSites.length===0){
+        /* No callSites hook yet — add one covering .text for definedFns */
+        const dfMap={};
         for(const[name,addr]of Object.entries(staticFns)){
-          const stubAddr=stubs[name];
-          if(stubAddr===undefined)continue;
-          const handler=handlers[stubAddr];
-          if(!handler)continue;
-          uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
-            let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
-            if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
-            if(name==='canvas_commit'){commitSeen=true;renderDisplay();}
-            const lr=(uc_h.reg_read(RP.LR)>>>0)&~1;
-            uc_h.reg_write(RP.PC,lr?lr:0xFEFEFEFE);
-          },addr,addr);
+          if(stubs[name]!==undefined&&handlers[stubs[name]])dfMap[addr>>>0]={name,isDF:true};
         }
+        addLog(`[EMU] Intercepting ${Object.keys(dfMap).length} defined SDK functions`);
+        uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
+          const e=dfMap[addr>>>0];if(!e)return;
+          const handler=handlers[stubs[e.name]];
+          let ret;try{ret=handler(uc_h);}catch(er){ret=0;}
+          if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
+          if(e.name==='canvas_commit'){commitSeen=true;renderDisplay();}
+          const lr=(uc_h.reg_read(RP.LR)>>>0)&~1;
+          uc_h.reg_write(RP.PC,lr?lr:0xFEFEFEFE);
+        },LOAD_BASE,LOAD_BASE+4*1024*1024);
+      } else if(staticCount>0){
+        /* Merge definedFns into the existing csMap (re-add hook) — handled below */
       }
       /* triggerDraw: call the registered draw callback with a fake canvas */
       const triggerDraw=()=>{
@@ -692,20 +736,33 @@ function App(){
         sv[0].forEach(([r,v])=>uc.reg_write(r,v));
       };
       const{entry,callSites}=loadFAP(uc,fap,stubs,addLog);
+      /* Static call sites: ONE hook covering all of .text, map lookup per instruction */
       if(callSites.length>0){
-        addLog(`[EMU] Hooking ${callSites.length} static call sites`);
+        const csMap={};
         for(const{addr,symName}of callSites){
-          const stubAddr=stubs[symName];if(stubAddr===undefined)continue;
-          const handler=handlers[stubAddr];if(!handler)continue;
-          uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
-            let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
-            if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
-            if(symName==='canvas_commit'){commitSeen=true;renderDisplay();}
-            if(symName==='view_port_update'||symName==='gui_add_view_port'){pendingDrawRef.current=true;}
-            uc_h.reg_write(RP.PC,(addr+4)>>>0);  /* skip the BL instruction */
-          },addr,addr);
+          if(stubs[symName]!==undefined&&handlers[stubs[symName]])csMap[addr>>>0]=symName;
         }
+        const csCount=Object.keys(csMap).length;
+        addLog(`[EMU] Hooking ${csCount} static call sites (single-hook)`);
+        uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
+          const symName=csMap[addr>>>0];if(symName===undefined)return;
+          const handler=handlers[stubs[symName]];
+          let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
+          if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
+          if(symName==='canvas_commit'){commitSeen=true;renderDisplay();}
+          if(symName==='view_port_update'||symName==='gui_add_view_port'){pendingDrawRef.current=true;}
+          uc_h.reg_write(RP.PC,(addr+4)>>>0);
+        },LOAD_BASE,LOAD_BASE+4*1024*1024);
       }
+      /* Re-emit .fast.rel.text diagnostic so it survives the setLogs([]) clear */
+      {const fr=fap.rawSections?.find(s=>s.name==='.fast.rel.text');
+      if(fr){const u8=new Uint8Array(fap.buffer,fr.offset,Math.min(fr.size,80));
+        const hex=Array.from(u8).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+        addLog(`[FAST] size=${fr.size} bytes: ${hex}`);
+        const dv=new DataView(fap.buffer,fr.offset,fr.size);
+        const cnt=dv.getUint32(0,true);
+        addLog(`[FAST] count=${cnt} entry_size=${((fr.size-4)/cnt).toFixed(2)}`);
+      }}
       addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
       try{uc.emu_start(entry,0xFEFEFEFE,0,2000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
       renderDisplay();
