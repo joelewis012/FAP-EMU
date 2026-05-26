@@ -86,7 +86,7 @@ function parseELF(buffer){
   const strings=[];if(rodata){let cur='';for(let i=0;i<rodata.size;i++){const c=u8[rodata.offset+i];if(c===0&&cur.length>=3){strings.push(cur);cur='';}else if(c>=32&&c<127)cur+=String.fromCharCode(c);else cur='';}}
   const appId=strings.find(s=>/^[a-z][a-z0-9_]{2,24}$/.test(s)&&!['text','data','bss','got','plt'].includes(s));
   const appName=strings.find(s=>/^[A-Z][A-Za-z0-9 \-_]{2,30}$/.test(s)&&s!==appId);
-  const relSections=shdrs.filter(s=>s.name.startsWith('.rel'));
+  const relSections=shdrs.filter(s=>s.name.startsWith('.rel')&&(s.type===9||s.type===4));
   const sections=shdrs.filter(s=>s.name&&s.name.length>0&&s.size>0);
   /* Parse program headers for correct VMA-based loading */
   const ePhoff=view.getUint32(28,le),ePhentsize=view.getUint16(42,le)||32,ePhnum=view.getUint16(44,le);
@@ -409,6 +409,7 @@ function loadFAP(uc,fap,stubs,log){
     ls(textSec);ls(sec('.rodata'));ls(sec('.data'));ls(sec('.got'));ls(sec('.got.plt'));
     const bss=sec('.bss');if(bss){const dst=bss.addr+delta;const isW=(bss.flags&1)!==0;const t=(isW&&dst>=LOAD_BASE&&dst<textEnd)?RAM_BASE+(dst-LOAD_BASE):dst;try{uc.mem_write(t,new Uint8Array(bss.size));}catch(e){}}
   }
+  const callSites=[];
   for(const rel of fap.relSections){
     const hasA=rel.name.startsWith('.rela'),ent=hasA?12:8,cnt=Math.floor(rel.size/ent);
     /* Use the rel section's link field to find its symbol table, then that symtab's link for the string table */
@@ -418,13 +419,16 @@ function loadFAP(uc,fap,stubs,log){
       const o=rel.offset+i*ent,offset=view.getUint32(o,le)+delta,info=view.getUint32(o+4,le);
       const symIdx=info>>8,relType=info&0xFF,addend=hasA?view.getInt32(o+8,le):0;
       let symName='';if(relSymSec&&relStrSec&&symIdx>0){const so=relSymSec.offset+symIdx*(relSymSec.entsize||16);symName=rs(relStrSec.offset+view.getUint32(so,le));}
-      if(relType===21||relType===22){stubs._regUnknown(symName);const sa=stubs[symName];if(sa!==undefined){w32(offset,sa);log(`[REL] ${symName}`);}}
+      if(relType===21||relType===22){stubs._regUnknown(symName);const sa=stubs[symName];if(sa!==undefined){w32(offset,sa);log(`[REL] SLOT ${symName}`);}}
       else if(relType===23){w32(offset,LOAD_BASE+addend);}
       else if(relType===2){try{const cur=view.getUint32(offset,le);w32(offset,cur+(LOAD_BASE-baseVA));}catch(e){}}
+      else if(relType===10||relType===28){/* R_ARM_THM_CALL/CALL — hook call site */
+        if(symName){stubs._regUnknown(symName);callSites.push({addr:offset,symName});log(`[REL] CALL ${symName} @ 0x${offset.toString(16)}`);}
+      }
     }
   }
   uc.reg_write(RP.SP,STACK_TOP);uc.reg_write(RP.LR,0xFEFEFEFE);
-  const entry=hasPhdrs?(fap.eEntry|1):((fap.eEntry+delta)|1);log(`[EMU] Entry: 0x${entry.toString(16)}`);return entry;
+  const entry=hasPhdrs?(fap.eEntry|1):((fap.eEntry+delta)|1);log(`[EMU] Entry: 0x${entry.toString(16)}`);return{entry,callSites};
 }
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
@@ -687,7 +691,21 @@ function App(){
         try{uc.emu_start(cb|1,0xFEFEFEFE,0,1000000);commitSeen=true;renderDisplay();}catch(e){addLog(`[DRAW] err: ${e?.message??String(e)}`);}
         sv[0].forEach(([r,v])=>uc.reg_write(r,v));
       };
-      const entry=loadFAP(uc,fap,stubs,addLog);
+      const{entry,callSites}=loadFAP(uc,fap,stubs,addLog);
+      if(callSites.length>0){
+        addLog(`[EMU] Hooking ${callSites.length} static call sites`);
+        for(const{addr,symName}of callSites){
+          const stubAddr=stubs[symName];if(stubAddr===undefined)continue;
+          const handler=handlers[stubAddr];if(!handler)continue;
+          uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
+            let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
+            if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
+            if(symName==='canvas_commit'){commitSeen=true;renderDisplay();}
+            if(symName==='view_port_update'||symName==='gui_add_view_port'){pendingDrawRef.current=true;}
+            uc_h.reg_write(RP.PC,(addr+4)>>>0);  /* skip the BL instruction */
+          },addr,addr);
+        }
+      }
       addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
       try{uc.emu_start(entry,0xFEFEFEFE,0,2000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
       renderDisplay();
