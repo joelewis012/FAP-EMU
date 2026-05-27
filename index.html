@@ -92,7 +92,9 @@ function parseELF(buffer){
   const ePhoff=view.getUint32(28,le),ePhentsize=view.getUint16(42,le)||32,ePhnum=view.getUint16(44,le);
   const phdrs=[];
   for(let i=0;i<ePhnum;i++){const o=ePhoff+i*ePhentsize;phdrs.push({type:view.getUint32(o,le),offset:view.getUint32(o+4,le),vaddr:view.getUint32(o+8,le),paddr:view.getUint32(o+12,le),filesz:view.getUint32(o+16,le),memsz:view.getUint32(o+20,le),flags:view.getUint32(o+24,le)});}
-  return{fileName:'',fileSize:buffer.byteLength,buffer,eEntry,isDyn:view.getUint16(16,le)===3,sections,rawSections:shdrs,phdrs,imports,definedFns,relSections,appId,appName,textSize:sections.find(s=>s.name==='.text')?.size??0,rodataSize:rodata?.size??0,bssSize:sections.find(s=>s.name==='.bss')?.size??0,dataSize:sections.find(s=>s.name==='.data')?.size??0};
+  const fastRelSec=shdrs.find(s=>s.name==='.fast.rel.text');
+  const fastRelBytes=fastRelSec?Array.from(u8.slice(fastRelSec.offset,fastRelSec.offset+fastRelSec.size)):null;
+  return{fileName:'',fileSize:buffer.byteLength,buffer,eEntry,isDyn:view.getUint16(16,le)===3,sections,rawSections:shdrs,phdrs,imports,definedFns,relSections,fastRelBytes,appId,appName,textSize:sections.find(s=>s.name==='.text')?.size??0,rodataSize:rodata?.size??0,bssSize:sections.find(s=>s.name==='.bss')?.size??0,dataSize:sections.find(s=>s.name==='.data')?.size??0};
 }
 
 /* ── Display (Phase 3: icon rendering from XBM bitmap in memory) ──────── */
@@ -754,15 +756,14 @@ function App(){
           uc_h.reg_write(RP.PC,(addr+4)>>>0);
         },LOAD_BASE,LOAD_BASE+4*1024*1024);
       }
-      /* Re-emit .fast.rel.text diagnostic so it survives the setLogs([]) clear */
-      {const fr=fap.rawSections?.find(s=>s.name==='.fast.rel.text');
-      if(fr){const u8=new Uint8Array(fap.buffer,fr.offset,Math.min(fr.size,80));
-        const hex=Array.from(u8).map(b=>b.toString(16).padStart(2,'0')).join(' ');
-        addLog(`[FAST] size=${fr.size} bytes: ${hex}`);
-        const dv=new DataView(fap.buffer,fr.offset,fr.size);
+      /* Re-emit .fast.rel.text using pre-stored bytes (avoids ArrayBuffer lookup) */
+      if(fap.fastRelBytes&&fap.fastRelBytes.length>0){
+        const hex=fap.fastRelBytes.slice(0,80).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+        addLog(`[FAST] size=${fap.fastRelBytes.length} bytes: ${hex}`);
+        const dv=new DataView(new Uint8Array(fap.fastRelBytes).buffer);
         const cnt=dv.getUint32(0,true);
-        addLog(`[FAST] count=${cnt} entry_size=${((fr.size-4)/cnt).toFixed(2)}`);
-      }}
+        addLog(`[FAST] count=${cnt} entry_size=${((fap.fastRelBytes.length-4)/cnt).toFixed(2)}`);
+      }else{addLog('[FAST] no .fast.rel.text section found');}
       addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
       try{uc.emu_start(entry,0xFEFEFEFE,0,2000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
       renderDisplay();
