@@ -508,6 +508,52 @@ function loadFAP(uc,fap,stubs,log){
     }
     log(`[FAST] Resolved ${sdkOk} Flipper SDK PLT slots`);
   }
+  /* ── Parse .fast.rel.text to fill Flipper SDK PLT slots ─────────────────── */
+  if(fap.fastRelBytes&&fap.fastRelBytes.length>5){
+    const fr=new Uint8Array(fap.fastRelBytes);
+    const frdv=new DataView(fr.buffer);
+    /* DJB2 hash function matching Flipper firmware */
+    const djb2=(s)=>{let h=5381;for(const c of s)h=(((h<<5)+h)+c.charCodeAt(0))>>>0;return h;};
+    /* Build hash→name map for all known stubs */
+    const h2n={};
+    for(const name of Object.keys(stubs)){if(typeof stubs[name]==='number'&&name!=='_regUnknown'&&name!=='_getVPDraw'&&name!=='_getVPCtx')h2n[djb2(name)]=name;}
+    let pos=5,resolved=0;
+    while(pos<fr.length-8){
+      const type=fr[pos];
+      if(type===0x8A){
+        /* EABI math: skip header+sites */
+        if(pos+13>fr.length)break;
+        const count=frdv.getUint32(pos+9,true);
+        pos+=13+count*3;
+      }else if(type===0x02){
+        /* Flipper SDK: hash + PLT stub offsets */
+        if(pos+9>fr.length)break;
+        const hash=frdv.getUint32(pos+1,true);
+        const count=frdv.getUint32(pos+5,true);
+        const fnName=h2n[hash];
+        for(let i=0;i<count;i++){
+          if(pos+9+i*3+2>=fr.length)break;
+          const stubOff=fr[pos+9+i*3]|(fr[pos+9+i*3+1]<<8)|(fr[pos+9+i*3+2]<<16);
+          const stubAddr=LOAD_BASE+stubOff;
+          if(fnName&&stubs[fnName]!==undefined){
+            /* Scan stub for first 4-aligned zero word (the PLT slot) */
+            let slotAddr=null;
+            for(let o=4;o<=20;o+=2){
+              const a=(stubAddr+o+3)&~3;
+              if(a-stubAddr>20)break;
+              try{const b=new Uint8Array(4);uc.mem_read(a,b);if(new DataView(b.buffer).getUint32(0,true)===0){slotAddr=a;break;}}catch(e){}
+            }
+            if(slotAddr){w32(slotAddr,stubs[fnName]);log(`[FAST] ${fnName} → slot@0x${slotAddr.toString(16)}`);resolved++;}
+            else{log(`[FAST] ${fnName} stub@0x${stubAddr.toString(16)} — slot not found`);}
+          }else{
+            log(`[FAST] unknown hash 0x${hash.toString(16)} stub@0x${stubOff.toString(16)}`);
+          }
+        }
+        pos+=9+count*3;
+      }else{log(`[FAST] unknown type 0x${type.toString(16)} at pos ${pos}`);break;}
+    }
+    log(`[FAST] resolved ${resolved} SDK slots`);
+  }
   const entry=hasPhdrs?(fap.eEntry|1):((fap.eEntry+delta)|1);log(`[EMU] Entry: 0x${entry.toString(16)}`);return{entry,callSites};
 }
 
