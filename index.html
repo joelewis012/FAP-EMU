@@ -459,55 +459,6 @@ function loadFAP(uc,fap,stubs,log){
     }
   }
   uc.reg_write(RP.SP,STACK_TOP);uc.reg_write(RP.LR,0xFEFEFEFE);
-  /* Parse .fast.rel.text to resolve Flipper SDK PLT slots */
-  if(fap.fastRelBytes&&fap.fastRelBytes.length>5){
-    const fr=new Uint8Array(fap.fastRelBytes);
-    const frdv=new DataView(fr.buffer);
-    /* DJB2 hash — matches Flipper's API hash algorithm */
-    const djb2=(s)=>{let h=5381;for(const c of s)h=((h*33)+c.charCodeAt(0))&0xFFFFFFFF;return h>>>0;};
-    /* Build hash→stubAddr map for all registered stubs */
-    const hashMap={};
-    for(const [name,addr] of Object.entries(stubs)){if(typeof addr==='number'&&name[0]!=='_')hashMap[djb2(name)>>>0]=name;}
-    /* Read 4 bytes from emulated memory */
-    const mr4=(a)=>{const b=new ArrayBuffer(4);try{uc.mem_read(a>>>0,b);}catch(e){}return new DataView(b).getUint32(0,true);};
-    let pos=5,sdkOk=0;
-    while(pos<fr.length-1){
-      const type=fr[pos];
-      if(type===0x8A){
-        /* EABI math: skip entry (already handled by csMap) */
-        if(pos+13>fr.length)break;
-        const count=frdv.getUint32(pos+9,true);
-        pos+=13+count*3;
-      }else if(type===0x02){
-        /* Flipper SDK: hash→PLT stub addr(s) */
-        if(pos+9>fr.length)break;
-        const hash=frdv.getUint32(pos+1,true)>>>0;
-        const count=frdv.getUint32(pos+5,true);
-        const fnName=hashMap[hash];
-        const stubAddr=stubs[fnName];
-        for(let i=0;i<count;i++){
-          if(pos+9+i*3+2>=fr.length)break;
-          const pltOff=fr[pos+9+i*3]|(fr[pos+9+i*3+1]<<8)|(fr[pos+9+i*3+2]<<16);
-          const pltAddr=LOAD_BASE+pltOff;
-          if(fnName&&stubAddr!==undefined){
-            /* Find PLT slot: first 4-byte-aligned zero within 20 bytes of stub */
-            let slotAddr=null;
-            for(let o=4;o<=20;o+=2){
-              const a=((pltAddr+o)+3)&~3;
-              if(a-pltAddr>20)break;
-              if(mr4(a)===0){slotAddr=a;break;}
-            }
-            if(slotAddr){w32(slotAddr,stubAddr);log(`[FAST] ${fnName} slot @ 0x${slotAddr.toString(16)}`);sdkOk++;}
-            else{log(`[FAST] ${fnName} slot not found @ 0x${pltAddr.toString(16)}`);}
-          }else{
-            log(`[FAST] unknown hash 0x${hash.toString(16)} plt=0x${pltOff.toString(16)}`);
-          }
-        }
-        pos+=9+count*3;
-      }else{log(`[FAST] unknown type 0x${type.toString(16)} @ pos ${pos}`);break;}
-    }
-    log(`[FAST] Resolved ${sdkOk} Flipper SDK PLT slots`);
-  }
   /* ── Parse .fast.rel.text to fill Flipper SDK PLT slots ─────────────────── */
   if(fap.fastRelBytes&&fap.fastRelBytes.length>5){
     const fr=new Uint8Array(fap.fastRelBytes);
@@ -525,32 +476,36 @@ function loadFAP(uc,fap,stubs,log){
         if(pos+13>fr.length)break;
         const count=frdv.getUint32(pos+9,true);
         pos+=13+count*3;
-      }else if(type===0x02){
-        /* Flipper SDK: hash + PLT stub offsets */
+      }else if(type===0x02||type===0x82){
+        /* Flipper SDK entry: 0x02 = standard, 0x82 = flagged variant (same structure) */
         if(pos+9>fr.length)break;
         const hash=frdv.getUint32(pos+1,true);
         const count=frdv.getUint32(pos+5,true);
+        if(count>500){log(`[FAST] bad count ${count} at pos ${pos}, skipping`);pos++;continue;}
         const fnName=h2n[hash];
         for(let i=0;i<count;i++){
           if(pos+9+i*3+2>=fr.length)break;
           const stubOff=fr[pos+9+i*3]|(fr[pos+9+i*3+1]<<8)|(fr[pos+9+i*3+2]<<16);
           const stubAddr=LOAD_BASE+stubOff;
           if(fnName&&stubs[fnName]!==undefined){
-            /* Scan stub for first 4-aligned zero word (the PLT slot) */
+            /* Scan stub for first 4-aligned zero word (the PLT slot) — up to 32 bytes */
             let slotAddr=null;
-            for(let o=4;o<=20;o+=2){
+            for(let o=0;o<=32;o+=2){
               const a=(stubAddr+o+3)&~3;
-              if(a-stubAddr>20)break;
+              if(a-stubAddr>32)break;
               try{const b=new Uint8Array(4);uc.mem_read(a,b);if(new DataView(b.buffer).getUint32(0,true)===0){slotAddr=a;break;}}catch(e){}
             }
-            if(slotAddr){w32(slotAddr,stubs[fnName]);log(`[FAST] ${fnName} → slot@0x${slotAddr.toString(16)}`);resolved++;}
-            else{log(`[FAST] ${fnName} stub@0x${stubAddr.toString(16)} — slot not found`);}
-          }else{
-            log(`[FAST] unknown hash 0x${hash.toString(16)} stub@0x${stubOff.toString(16)}`);
+            if(slotAddr){w32(slotAddr,stubs[fnName]);log(`[FAST] ${fnName} → 0x${slotAddr.toString(16)}`);resolved++;}
+            else{log(`[FAST] ${fnName} — no slot near 0x${stubAddr.toString(16)}`);}
+          }else if(fnName===undefined){
+            log(`[FAST] hash 0x${hash.toString(16)} unknown`);
           }
         }
         pos+=9+count*3;
-      }else{log(`[FAST] unknown type 0x${type.toString(16)} at pos ${pos}`);break;}
+      }else if(type===0x01||type===0x00){
+        /* Skip padding/alignment bytes */
+        pos++;
+      }else{log(`[FAST] unknown type 0x${type.toString(16)} at pos ${pos} — skipping`);pos++;continue;}
     }
     log(`[FAST] resolved ${resolved} SDK slots`);
   }
