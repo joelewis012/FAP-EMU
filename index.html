@@ -440,7 +440,7 @@ function loadFAP(uc,fap,stubs,log){
     ls(textSec);ls(sec('.rodata'));ls(sec('.data'));ls(sec('.got'));ls(sec('.got.plt'));
     const bss=sec('.bss');if(bss){const dst=bss.addr+delta;const isW=(bss.flags&1)!==0;const t=(isW&&dst>=LOAD_BASE&&dst<textEnd)?RAM_BASE+(dst-LOAD_BASE):dst;try{uc.mem_write(t,new Uint8Array(bss.size));}catch(e){}}
   }
-  const callSites=[];
+  const callSites=[],fastCallSites=[];
   for(const rel of fap.relSections){
     const hasA=rel.name.startsWith('.rela'),ent=hasA?12:8,cnt=Math.floor(rel.size/ent);
     /* Use the rel section's link field to find its symbol table, then that symtab's link for the string table */
@@ -488,15 +488,12 @@ function loadFAP(uc,fap,stubs,log){
           const stubOff=fr[pos+9+i*3]|(fr[pos+9+i*3+1]<<8)|(fr[pos+9+i*3+2]<<16);
           const stubAddr=LOAD_BASE+stubOff;
           if(fnName&&stubs[fnName]!==undefined){
-            /* Scan stub for first 4-aligned zero word (the PLT slot) — up to 32 bytes */
-            let slotAddr=null;
-            for(let o=0;o<=32;o+=2){
-              const a=(stubAddr+o+3)&~3;
-              if(a-stubAddr>32)break;
-              try{const b=new Uint8Array(4);uc.mem_read(a,b);if(new DataView(b.buffer).getUint32(0,true)===0){slotAddr=a;break;}}catch(e){}
-            }
-            if(slotAddr){w32(slotAddr,stubs[fnName]);log(`[FAST] ${fnName} → 0x${slotAddr.toString(16)}`);resolved++;}
-            else{log(`[FAST] ${fnName} — no slot near 0x${stubAddr.toString(16)}`);}
+            /* Write our stub address into the PLT slot so the BLX mechanism works */
+            const sb4=new Uint8Array(4);new DataView(sb4.buffer).setUint32(0,stubs[fnName],true);
+            try{uc.mem_write(stubAddr,sb4);}catch(e){}
+            /* Also hook the address directly as a backup */
+            fastCallSites.push({addr:stubAddr,symName:fnName});
+            log(`[FAST] ${fnName} slot@0x${stubAddr.toString(16)} → stub@0x${stubs[fnName].toString(16)}`);resolved++;
           }else if(fnName===undefined){
             log(`[FAST] hash 0x${hash.toString(16)} unknown`);
           }
@@ -509,7 +506,7 @@ function loadFAP(uc,fap,stubs,log){
     }
     log(`[FAST] resolved ${resolved} SDK slots`);
   }
-  const entry=hasPhdrs?(fap.eEntry|1):((fap.eEntry+delta)|1);log(`[EMU] Entry: 0x${entry.toString(16)}`);return{entry,callSites};
+  const entry=hasPhdrs?(fap.eEntry|1):((fap.eEntry+delta)|1);log(`[EMU] Entry: 0x${entry.toString(16)}`);return{entry,callSites,fastCallSites};
 }
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
@@ -787,23 +784,45 @@ function App(){
         try{uc.emu_start(cb|1,0xFEFEFEFE,0,1000000);commitSeen=true;renderDisplay();}catch(e){addLog(`[DRAW] err: ${e?.message??String(e)}`);}
         sv[0].forEach(([r,v])=>uc.reg_write(r,v));
       };
-      const{entry,callSites}=loadFAP(uc,fap,stubs,addLog);
-      /* Static call sites: ONE hook covering all of .text, map lookup per instruction */
-      if(callSites.length>0){
-        const csMap={};
+      const{entry,callSites,fastCallSites}=loadFAP(uc,fap,stubs,addLog);
+      /* Combined hook: .rel.text call sites (skip BL, PC+4) +
+         .fast.rel.text entry points (return via LR) */
+      {
+        const csMap={};  // BL call sites — skip instruction (PC+4)
+        const fastMap={};// FAST entry points — return via LR
         for(const{addr,symName}of callSites){
           if(stubs[symName]!==undefined&&handlers[stubs[symName]])csMap[addr>>>0]=symName;
         }
-        const csCount=Object.keys(csMap).length;
-        addLog(`[EMU] Hooking ${csCount} static call sites (single-hook)`);
+        for(const{addr,symName}of (fastCallSites||[])){
+          if(stubs[symName]!==undefined&&handlers[stubs[symName]])fastMap[addr>>>0]=symName;
+        }
+        const csCount=Object.keys(csMap).length,fcCount=Object.keys(fastMap).length;
+        addLog(`[EMU] Hooking ${csCount} BL sites + ${fcCount} FAST entry points`);
         uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
-          const symName=csMap[addr>>>0];if(symName===undefined)return;
-          const handler=handlers[stubs[symName]];
-          let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
-          if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
-          if(symName==='canvas_commit'){commitSeen=true;renderDisplay();}
-          if(symName==='view_port_update'||symName==='gui_add_view_port'){pendingDrawRef.current=true;}
-          uc_h.reg_write(RP.PC,(addr+4)>>>0);
+          const ua=addr>>>0;
+          /* Check BL call-site map first (skip 4 bytes) */
+          let symName=csMap[ua];
+          if(symName!==undefined){
+            const handler=handlers[stubs[symName]];
+            let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
+            if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
+            if(symName==='canvas_commit'){commitSeen=true;renderDisplay();}
+            if(symName==='view_port_update'||symName==='gui_add_view_port'){pendingDrawRef.current=true;}
+            uc_h.reg_write(RP.PC,(ua+4)>>>0);
+            return;
+          }
+          /* Check FAST entry-point map (return via LR) */
+          symName=fastMap[ua];
+          if(symName!==undefined){
+            const handler=handlers[stubs[symName]];
+            let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
+            if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
+            if(symName==='canvas_commit'){commitSeen=true;renderDisplay();}
+            if(symName==='view_port_update'||symName==='gui_add_view_port'){pendingDrawRef.current=true;}
+            const lr=(uc_h.reg_read(RP.LR)>>>0)&~1;
+            uc_h.reg_write(RP.PC,lr||0xFEFEFEFE);
+            return;
+          }
         },LOAD_BASE,LOAD_BASE+4*1024*1024);
       }
       /* Re-emit .fast.rel.text using pre-stored bytes (avoids ArrayBuffer lookup) */
