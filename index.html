@@ -490,10 +490,16 @@ function loadFAP(uc,fap,stubs,log){
           if(fnName&&stubs[fnName]!==undefined){
             /* Write our stub address into the PLT slot so the BLX mechanism works */
             const sb4=new Uint8Array(4);new DataView(sb4.buffer).setUint32(0,stubs[fnName],true);
-            try{uc.mem_write(stubAddr,sb4);}catch(e){}
+            let writeOk=false;
+            try{uc.mem_write(stubAddr,sb4);
+              /* Verify: read back */
+              const rb=new ArrayBuffer(4);uc.mem_read(stubAddr,rb);
+              const rbv=new DataView(rb).getUint32(0,true);
+              writeOk=(rbv===stubs[fnName]);
+            }catch(e){log(`[FAST] write err ${fnName}: ${e?.message??String(e)}`);}
             /* Also hook the address directly as a backup */
             fastCallSites.push({addr:stubAddr,symName:fnName});
-            log(`[FAST] ${fnName} slot@0x${stubAddr.toString(16)} → stub@0x${stubs[fnName].toString(16)}`);resolved++;
+            log(`[FAST] ${fnName} slot@0x${stubAddr.toString(16)} → stub@0x${stubs[fnName].toString(16)} verify:${writeOk?'OK':'FAIL'}`);resolved++;
           }else if(fnName===undefined){
             log(`[FAST] hash 0x${hash.toString(16)} unknown`);
           }
@@ -702,9 +708,10 @@ function App(){
         onDraw:()=>{pendingDrawRef.current=true;},
         onWaitInput:(uc_h)=>{waitingInputRef.current=true;pendingDrawRef.current=true;uc_h.emu_stop();}
       });
+      let stubCallCount=0;
       uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
         const h=handlers[addr];
-        if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e?.message??String(e)}`);ret=0;}if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);const lr=uc_h.reg_read(RP.LR)>>>0;uc_h.reg_write(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
+        if(h!==undefined){stubCallCount++;let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e?.message??String(e)}`);ret=0;}if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);const lr=uc_h.reg_read(RP.LR)>>>0;uc_h.reg_write(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
         if((uc_h.reg_read(RP.PC)>>>0)===0xFEFEFEFE)uc_h.emu_stop();
       },STUB_BASE,STUB_BASE+0x100000);
       /* HOOK_INTR — log software interrupts (SVC etc) */
@@ -722,19 +729,19 @@ function App(){
         uc_h.reg_write(RP.R2,retR2>>>0);uc_h.reg_write(RP.R3,retR3>>>0);
         uc_h.reg_write(RP.LR,retLR>>>0);
         const dst=(retPC>>>0);
-        if(dst===0xFEFEFEFE||dst===0){
+        if(dst===0xFEFEFEFE){
           uc_h.emu_stop();
           emuStateRef.current='idle';
           if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}
-          if(!commitSeen){
-            addLog('[WARN] App exited without drawing anything.');
-            addLog('[WARN] Static binaries require full Flipper OS simulation — canvas calls go to hardware, not our stubs.');
-            addLog('[WARN] Make sure your app calls view_port_draw_callback_set before gui_add_view_port.');
-            setError('App exited without drawing. SDK stubs returned no-ops — try pressing OK/UP after RUN to trigger input-driven draws.');
-          } else {
-            addLog('[EMU] App exited normally.');
-          }
+          if(!commitSeen){setError('App exited without drawing. Check LOG for [FURI]/[GUI]/[DRAW] entries.');}
+          else{addLog('[EMU] App exited normally.');}
           setEmuState('idle');
+        } else if(dst===0){
+          /* Frame pop gave PC=0 — Unicorn may not push exception frame; fall back to LR register */
+          const fallback=(uc_h.reg_read(RP.LR)>>>0)&~1;
+          addLog(`[EXC] frame PC=0, fallback LR=0x${fallback.toString(16)}`);
+          if(fallback&&fallback!==0xFEFEFEFE) uc_h.reg_write(RP.PC,(fallback|1)>>>0);
+          else uc_h.reg_write(RP.PC,((uc_h.reg_read(RP.PC)>>>0)+4)>>>0);
         }
         else{uc_h.reg_write(RP.PC,(dst|1)>>>0);}  // resume in THUMB mode
       },0xFFFF0000,0xFFFFFFFF);}catch(e){addLog(`[EXC] hook err: ${e?.message??String(e)}`);}
@@ -778,7 +785,7 @@ function App(){
       const triggerDraw=()=>{
         const cb=stubs._getVPDraw(),ctx=stubs._getVPCtx();
         if(!cb){addLog('[DRAW] no draw callback registered yet');return;}
-        const sv=[[RP.R0,RP.R1,RP.R2,RP.R3,RP.LR,RP.PC,RP.SP].map(r=>[r,uc.reg_read(r)>>>0])];
+        const sv=[RP.R0,RP.R1,RP.R2,RP.R3,RP.LR,RP.PC,RP.SP].map(r=>[r,uc.reg_read(r)>>>0]);
         uc.reg_write(RP.R0,CANVAS_FAKE);uc.reg_write(RP.R1,ctx>>>0);uc.reg_write(RP.LR,0xFEFEFEFE);
         addLog(`[DRAW] calling draw_cb @ 0x${cb.toString(16)}`);
         try{uc.emu_start(cb|1,0xFEFEFEFE,0,1000000);commitSeen=true;renderDisplay();}catch(e){addLog(`[DRAW] err: ${e?.message??String(e)}`);}
@@ -834,7 +841,7 @@ function App(){
         addLog(`[FAST] count=${cnt} entry_size=${((fap.fastRelBytes.length-4)/cnt).toFixed(2)}`);
       }else{addLog('[FAST] no .fast.rel.text section found');}
       addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
-      try{uc.emu_start(entry,0xFEFEFEFE,0,2000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
+      try{uc.emu_start(entry,0xFEFEFEFE,0,2000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}addLog(`[EMU] init done — ${stubCallCount} stub calls, pendingDraw=${pendingDrawRef.current}, waitingInput=${waitingInputRef.current}`);
       renderDisplay();
       const tick=()=>{
         if(emuStateRef.current!=='running'){loopRef.current=null;return;}
