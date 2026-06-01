@@ -841,7 +841,23 @@ function App(){
         addLog(`[FAST] count=${cnt} entry_size=${((fap.fastRelBytes.length-4)/cnt).toFixed(2)}`);
       }else{addLog('[FAST] no .fast.rel.text section found');}
       addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
-      try{uc.emu_start(entry,0xFEFEFEFE,0,2000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}addLog(`[EMU] init done — ${stubCallCount} stub calls, pendingDraw=${pendingDrawRef.current}, waitingInput=${waitingInputRef.current}`);
+      /* Watch for writes to the SDK slot area during execution */
+      const SLOT_START=0x8000000+0xc00,SLOT_END=0x8000000+0xe00;
+      let slotOverwrites=0;
+      try{uc.hook_add((window.uc.HOOK_MEM_WRITE??2048),(uc_h,_type,addr,size,val)=>{
+        const a=addr>>>0;
+        if(a>=SLOT_START&&a<SLOT_END){
+          slotOverwrites++;
+          const pc=(uc_h.reg_read(RP.PC)>>>0);
+          if(slotOverwrites<=10)addLog(`[OVW] slot 0x${a.toString(16)} ← 0x${(val>>>0).toString(16)} from PC=0x${pc.toString(16)}`);
+        }
+      },SLOT_START,SLOT_END);}catch(e){addLog(`[OVW] hook failed: ${e?.message??String(e)}`);}
+      try{uc.emu_start(entry,0xFEFEFEFE,0,2000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
+      addLog(`[EMU] init done — ${stubCallCount} stub calls, ${slotOverwrites} slot overwrites, pendingDraw=${pendingDrawRef.current}`);
+      /* Read back key slots to see if they survived */
+      [[0x8000d04,'furi_record_open'],[0x8000d0c,'gui_add_view_port'],[0x8000d14,'view_port_draw_callback_set'],[0x8000d28,'furi_message_queue_get']].forEach(([addr,name])=>{
+        try{const d=uc.mem_read(addr,4);const v=d&&d.length>=4?new DataView(d.buffer,d.byteOffset).getUint32(0,true):0;addLog(`[CHK] ${name} slot=0x${v.toString(16)}`);}catch(e){}
+      });
       renderDisplay();
       const tick=()=>{
         if(emuStateRef.current!=='running'){loopRef.current=null;return;}
