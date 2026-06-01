@@ -25,7 +25,7 @@ const LCD_W=128,LCD_H=64;
 const GB_ON=[15,56,15],GB_OFF=[155,188,15];
 const LOAD_BASE=0x08000000,RAM_BASE=0x20000000;
 const HEAP_BASE=0x20010000,STACK_TOP=0x20030000,STUB_BASE=0x40000000;
-const RP={R0:66,R1:67,R2:68,R3:69,SP:71,LR:72,PC:73};
+const RP={R0:66,R1:67,R2:68,R3:69,R12:78,SP:13,LR:11,PC:12}; /* UC_ARM_REG_* aliases */
 const CANVAS_FAKE=0x20001000;
 const EM_ARM=40,SHN_UNDEF=0;
 const InputKey={Up:0,Down:1,Left:2,Right:3,Ok:4,Back:5};
@@ -493,8 +493,8 @@ function loadFAP(uc,fap,stubs,log){
             let writeOk=false;
             try{uc.mem_write(stubAddr,sb4);
               /* Verify: read back */
-              const rb=new ArrayBuffer(4);uc.mem_read(stubAddr,rb);
-              const rbv=new DataView(rb).getUint32(0,true);
+              const rbdata=uc.mem_read(stubAddr,4);
+              const rbv=(rbdata&&rbdata.length>=4)?new DataView(rbdata.buffer,rbdata.byteOffset).getUint32(0,true):0;
               writeOk=(rbv===stubs[fnName]);
             }catch(e){log(`[FAST] write err ${fnName}: ${e?.message??String(e)}`);}
             /* Also hook the address directly as a backup */
@@ -719,7 +719,7 @@ function App(){
       /* EXC_RETURN hook — simulate Cortex-M exception return by popping the hardware frame */
       try{uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
         /* Read 4 bytes from emulated memory */
-        const r32=(a)=>{const b=new ArrayBuffer(4);try{uc_h.mem_read(a>>>0,b);}catch(e){}return new DataView(b).getUint32(0,true);};
+        const r32=(a)=>{try{const d=uc_h.mem_read(a>>>0,4);if(d&&d.length>=4)return new DataView(d.buffer,d.byteOffset).getUint32(0,true);}catch(e){}return 0;};
         const sp=(uc_h.reg_read(RP.SP)>>>0);
         /* Cortex-M exception frame: R0,R1,R2,R3,R12,LR,PC,xPSR at SP..SP+31 */
         const retR0=r32(sp),retR1=r32(sp+4),retR2=r32(sp+8),retR3=r32(sp+12);
