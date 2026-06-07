@@ -25,8 +25,7 @@ const LCD_W=128,LCD_H=64;
 const GB_ON=[15,56,15],GB_OFF=[155,188,15];
 const LOAD_BASE=0x08000000,RAM_BASE=0x20000000;
 const HEAP_BASE=0x20010000,STACK_TOP=0x20030000,STUB_BASE=0x40000000;
-const RP={R0:66,R1:67,R2:68,R3:69,R12:78,SP:13,LR:11,PC:12}; /* UC_ARM_REG_* aliases */
-const CANVAS_FAKE=0x20001000;
+const RP={R0:66,R1:67,R2:68,R3:69,SP:71,LR:72,PC:73};
 const EM_ARM=40,SHN_UNDEF=0;
 const InputKey={Up:0,Down:1,Left:2,Right:3,Ok:4,Back:5};
 const InputType={Press:0,Release:1,Short:2};
@@ -81,20 +80,18 @@ function parseELF(buffer){
   /* Also extract DEFINED SDK function addresses for static binary interception */
   const SDK_FNS=new Set(['canvas_commit','canvas_clear','canvas_set_font','canvas_set_color','canvas_draw_str','canvas_draw_str_aligned','canvas_draw_dot','canvas_draw_line','canvas_draw_frame','canvas_draw_box','canvas_draw_circle','canvas_draw_disc','canvas_draw_icon','canvas_draw_xbm','canvas_width','canvas_height','view_port_alloc','view_port_free','view_port_enabled_set','view_port_draw_callback_set','view_port_input_callback_set','view_port_update','gui_add_view_port','gui_remove_view_port','furi_delay_ms','furi_delay_tick','furi_thread_yield','furi_record_open','furi_record_close','malloc','free','calloc','realloc','furi_message_queue_alloc','furi_message_queue_put','furi_message_queue_get','furi_message_queue_free','furi_semaphore_alloc','furi_semaphore_acquire','furi_semaphore_release','furi_semaphore_free','furi_mutex_alloc','furi_mutex_acquire','furi_mutex_release','furi_mutex_free']);
   const definedFns={};
-  if(symtab&&strtab){const ent=symtab.entsize||16,cnt=Math.floor(symtab.size/ent);for(let i=1;i<cnt;i++){const o=symtab.offset+i*ent,ni=view.getUint32(o,le),val=view.getUint32(o+4,le),info=u8[o+12],shndx=view.getUint16(o+14,le),name=rs(strtab.offset+ni);if(shndx!==SHN_UNDEF&&shndx!==0xFFFF&&val>0&&(info&0xf)<=2&&SDK_FNS.has(name))definedFns[name]=val;}}
+  if(symtab&&strtab){const ent=symtab.entsize||16,cnt=Math.floor(symtab.size/ent);for(let i=1;i<cnt;i++){const o=symtab.offset+i*ent,ni=view.getUint32(o,le),val=view.getUint32(o+4,le),info=u8[o+12],shndx=view.getUint16(o+14,le),name=rs(strtab.offset+ni);if(shndx!==SHN_UNDEF&&shndx!==0xFFFF&&val>0&&(info&0xf)===2&&SDK_FNS.has(name))definedFns[name]=val;}}
   const rodata=shdrs.find(s=>s.name==='.rodata');
   const strings=[];if(rodata){let cur='';for(let i=0;i<rodata.size;i++){const c=u8[rodata.offset+i];if(c===0&&cur.length>=3){strings.push(cur);cur='';}else if(c>=32&&c<127)cur+=String.fromCharCode(c);else cur='';}}
   const appId=strings.find(s=>/^[a-z][a-z0-9_]{2,24}$/.test(s)&&!['text','data','bss','got','plt'].includes(s));
   const appName=strings.find(s=>/^[A-Z][A-Za-z0-9 \-_]{2,30}$/.test(s)&&s!==appId);
-  const relSections=shdrs.filter(s=>s.name.startsWith('.rel')&&(s.type===9||s.type===4));
+  const relSections=shdrs.filter(s=>s.name.startsWith('.rel'));
   const sections=shdrs.filter(s=>s.name&&s.name.length>0&&s.size>0);
   /* Parse program headers for correct VMA-based loading */
   const ePhoff=view.getUint32(28,le),ePhentsize=view.getUint16(42,le)||32,ePhnum=view.getUint16(44,le);
   const phdrs=[];
   for(let i=0;i<ePhnum;i++){const o=ePhoff+i*ePhentsize;phdrs.push({type:view.getUint32(o,le),offset:view.getUint32(o+4,le),vaddr:view.getUint32(o+8,le),paddr:view.getUint32(o+12,le),filesz:view.getUint32(o+16,le),memsz:view.getUint32(o+20,le),flags:view.getUint32(o+24,le)});}
-  const fastRelSec=shdrs.find(s=>s.name==='.fast.rel.text');
-  const fastRelBytes=fastRelSec?Array.from(u8.slice(fastRelSec.offset,fastRelSec.offset+fastRelSec.size)):null;
-  return{fileName:'',fileSize:buffer.byteLength,buffer,eEntry,isDyn:view.getUint16(16,le)===3,sections,rawSections:shdrs,phdrs,imports,definedFns,relSections,fastRelBytes,appId,appName,textSize:sections.find(s=>s.name==='.text')?.size??0,rodataSize:rodata?.size??0,bssSize:sections.find(s=>s.name==='.bss')?.size??0,dataSize:sections.find(s=>s.name==='.data')?.size??0};
+  return{fileName:'',fileSize:buffer.byteLength,buffer,eEntry,isDyn:view.getUint16(16,le)===3,sections,rawSections:shdrs,phdrs,imports,definedFns,relSections,appId,appName,textSize:sections.find(s=>s.name==='.text')?.size??0,rodataSize:rodata?.size??0,bssSize:sections.find(s=>s.name==='.bss')?.size??0,dataSize:sections.find(s=>s.name==='.data')?.size??0};
 }
 
 /* ── Display (Phase 3: icon rendering from XBM bitmap in memory) ──────── */
@@ -147,7 +144,7 @@ class FlipperDisplay{
 }
 
 /* ── Stubs (Phase 3: ViewDispatcher, View, SceneManager, Widgets) ──────── */
-function buildStubs(display,inputQueueRef,logFn,cb={}){const{onDraw,onWaitInput}=cb;
+function buildStubs(display,inputQueueRef,logFn){
   const stubs={},handlers={};let nextAddr=STUB_BASE;
   const log=logFn||(()=>{});
   function reg(name,fn){stubs[name]=nextAddr;handlers[nextAddr]=fn;nextAddr+=4;}
@@ -188,11 +185,11 @@ function buildStubs(display,inputQueueRef,logFn,cb={}){const{onDraw,onWaitInput}
   reg('view_port_enabled_set',        ()=>{});
   reg('view_port_draw_callback_set',  (uc)=>{vpDraw=rr(uc,1);vpCtx=rr(uc,2);log(`[VP] draw_cb=0x${rr(uc,1).toString(16)}`);});
   reg('view_port_input_callback_set', (uc)=>{vpInput=rr(uc,1);log(`[VP] input_cb=0x${rr(uc,1).toString(16)}`);});
-  reg('view_port_update',             ()=>{onDraw?.();});
+  reg('view_port_update',             ()=>{});
   stubs._getVPDraw=()=>vpDraw;stubs._getVPInput=()=>vpInput;stubs._getVPCtx=()=>vpCtx;
 
   /* GUI */
-  reg('gui_add_view_port',         ()=>{log('[GUI] viewport added');onDraw?.();});
+  reg('gui_add_view_port',         ()=>log('[GUI] viewport added'));
   reg('gui_remove_view_port',      ()=>{});
   reg('gui_get_framebuffer_size',  ()=>1024);
 
@@ -202,7 +199,7 @@ function buildStubs(display,inputQueueRef,logFn,cb={}){const{onDraw,onWaitInput}
   reg('view_dispatcher_free',                         ()=>{});
   reg('view_dispatcher_enable_queue',                 ()=>{});
   reg('view_dispatcher_attach_to_gui',                ()=>log('[VD] attached to GUI'));
-  reg('view_dispatcher_run',                          ()=>{log('[VD] run() — event loop, triggering draw');onDraw?.();});
+  reg('view_dispatcher_run',                          ()=>log('[VD] run() — event loop started'));
   reg('view_dispatcher_stop',                         ()=>{});
   reg('view_dispatcher_add_view',                     ()=>{});
   reg('view_dispatcher_remove_view',                  ()=>{});
@@ -305,39 +302,6 @@ function buildStubs(display,inputQueueRef,logFn,cb={}){const{onDraw,onWaitInput}
   reg('menu_free',      ()=>{});
   reg('menu_get_view',  (uc)=>mm(uc,64));
 
-  /* ARM AEABI double-precision helpers — doubles passed as R0:R1 (a) and R2:R3 (b) */
-  {
-    const rdbl=(uc,r1,r2)=>{const b=new ArrayBuffer(8),dv=new DataView(b);dv.setUint32(0,uc.reg_read(r1)>>>0,true);dv.setUint32(4,uc.reg_read(r2)>>>0,true);return dv.getFloat64(0,true);};
-    const wdbl=(uc,r1,r2,v)=>{const b=new ArrayBuffer(8),dv=new DataView(b);dv.setFloat64(0,isNaN(v)?NaN:v,true);uc.reg_write(r1,dv.getUint32(0,true)>>>0);uc.reg_write(r2,dv.getUint32(4,true)>>>0);};
-    const ra=(uc)=>rdbl(uc,RP.R0,RP.R1),rb=(uc)=>rdbl(uc,RP.R2,RP.R3);
-    const wa=(uc,v)=>wdbl(uc,RP.R0,RP.R1,v);
-    reg('__aeabi_dadd',(uc)=>{wa(uc,ra(uc)+rb(uc));});
-    reg('__aeabi_dsub',(uc)=>{wa(uc,ra(uc)-rb(uc));});
-    reg('__aeabi_dmul',(uc)=>{wa(uc,ra(uc)*rb(uc));});
-    reg('__aeabi_ddiv',(uc)=>{wa(uc,ra(uc)/rb(uc));});
-    reg('__aeabi_dcmplt',(uc)=>ra(uc)<rb(uc)?1:0);
-    reg('__aeabi_dcmpgt',(uc)=>ra(uc)>rb(uc)?1:0);
-    reg('__aeabi_dcmpeq',(uc)=>ra(uc)===rb(uc)?1:0);
-    reg('__aeabi_dcmple',(uc)=>ra(uc)<=rb(uc)?1:0);
-    reg('__aeabi_dcmpge',(uc)=>ra(uc)>=rb(uc)?1:0);
-    reg('__aeabi_dcmpun',(uc)=>(isNaN(ra(uc))||isNaN(rb(uc)))?1:0);
-    reg('__aeabi_cdcmple',(uc)=>ra(uc)<=rb(uc)?0:1);
-    reg('__aeabi_cdrcmple',(uc)=>rb(uc)<=ra(uc)?0:1);
-    reg('__cmpdf2',(uc)=>{const a=ra(uc),b=rb(uc);return a<b?-1:a>b?1:0;});
-    reg('__aeabi_i2d',(uc)=>{wa(uc,(rr(uc,0)|0));});
-    reg('__aeabi_d2i',(uc)=>Math.trunc(ra(uc))|0);
-    reg('__ieee754_pow',(uc)=>{wa(uc,Math.pow(ra(uc),rb(uc)));});
-    reg('fabs',(uc)=>{wa(uc,Math.abs(ra(uc)));});
-    reg('finite',(uc)=>isFinite(ra(uc))?1:0);
-    reg('scalbn',(uc)=>{wa(uc,ra(uc)*Math.pow(2,rr(uc,2)|0));});
-    const ERRNO_ADDR=0x20000010;
-    reg('__errno',()=>ERRNO_ADDR);
-  }
-
-  /* Furi records */
-  reg('furi_record_open', (uc)=>{const name=rs(uc,rr(uc,0));log(`[FURI] record_open("${name}")`);return 0x20000200;});
-  reg('furi_record_close',()=>{});
-
   /* Memory */
   reg('malloc',    (uc)=>mm(uc,rr(uc,0)));
   reg('calloc',    (uc)=>mm(uc,rr(uc,0)*rr(uc,1)));
@@ -373,7 +337,7 @@ function buildStubs(display,inputQueueRef,logFn,cb={}){const{onDraw,onWaitInput}
   reg('furi_message_queue_alloc',(uc)=>mm(uc,64));
   reg('furi_message_queue_free',()=>{});
   reg('furi_message_queue_put',()=>0);
-  reg('furi_message_queue_get',(uc)=>{const q=inputQueueRef.current;if(q.length>0){const evt=q.shift();const buf=rr(uc,1);if(buf)w32(uc,buf,evt.key|(evt.type<<8));onDraw?.();return 0;}onWaitInput?.(uc);return 5;});
+  reg('furi_message_queue_get',(uc)=>{const q=inputQueueRef.current;if(q.length>0){const evt=q.shift();const buf=rr(uc,1);if(buf)w32(uc,buf,evt.key|(evt.type<<8));return 0;}return 5;});
 
   /* Thread */
   reg('furi_thread_alloc',(uc)=>mm(uc,64)); reg('furi_thread_free',()=>{});
@@ -440,7 +404,6 @@ function loadFAP(uc,fap,stubs,log){
     ls(textSec);ls(sec('.rodata'));ls(sec('.data'));ls(sec('.got'));ls(sec('.got.plt'));
     const bss=sec('.bss');if(bss){const dst=bss.addr+delta;const isW=(bss.flags&1)!==0;const t=(isW&&dst>=LOAD_BASE&&dst<textEnd)?RAM_BASE+(dst-LOAD_BASE):dst;try{uc.mem_write(t,new Uint8Array(bss.size));}catch(e){}}
   }
-  const callSites=[],fastCallSites=[];
   for(const rel of fap.relSections){
     const hasA=rel.name.startsWith('.rela'),ent=hasA?12:8,cnt=Math.floor(rel.size/ent);
     /* Use the rel section's link field to find its symbol table, then that symtab's link for the string table */
@@ -450,69 +413,13 @@ function loadFAP(uc,fap,stubs,log){
       const o=rel.offset+i*ent,offset=view.getUint32(o,le)+delta,info=view.getUint32(o+4,le);
       const symIdx=info>>8,relType=info&0xFF,addend=hasA?view.getInt32(o+8,le):0;
       let symName='';if(relSymSec&&relStrSec&&symIdx>0){const so=relSymSec.offset+symIdx*(relSymSec.entsize||16);symName=rs(relStrSec.offset+view.getUint32(so,le));}
-      if(relType===21||relType===22){stubs._regUnknown(symName);const sa=stubs[symName];if(sa!==undefined){w32(offset,sa);log(`[REL] SLOT ${symName}`);}}
+      if(relType===21||relType===22){stubs._regUnknown(symName);const sa=stubs[symName];if(sa!==undefined){w32(offset,sa);log(`[REL] ${symName}`);}}
       else if(relType===23){w32(offset,LOAD_BASE+addend);}
       else if(relType===2){try{const cur=view.getUint32(offset,le);w32(offset,cur+(LOAD_BASE-baseVA));}catch(e){}}
-      else if(relType===10||relType===28){/* R_ARM_THM_CALL/CALL — hook call site */
-        if(symName){stubs._regUnknown(symName);callSites.push({addr:offset,symName});log(`[REL] CALL ${symName} @ 0x${offset.toString(16)}`);}
-      }
     }
   }
   uc.reg_write(RP.SP,STACK_TOP);uc.reg_write(RP.LR,0xFEFEFEFE);
-  /* ── Parse .fast.rel.text to fill Flipper SDK PLT slots ─────────────────── */
-  if(fap.fastRelBytes&&fap.fastRelBytes.length>5){
-    const fr=new Uint8Array(fap.fastRelBytes);
-    const frdv=new DataView(fr.buffer);
-    /* DJB2 hash function matching Flipper firmware */
-    const djb2=(s)=>{let h=5381;for(const c of s)h=(((h<<5)+h)+c.charCodeAt(0))>>>0;return h;};
-    /* Build hash→name map for all known stubs */
-    const h2n={};
-    for(const name of Object.keys(stubs)){if(typeof stubs[name]==='number'&&name!=='_regUnknown'&&name!=='_getVPDraw'&&name!=='_getVPCtx')h2n[djb2(name)]=name;}
-    let pos=5,resolved=0;
-    while(pos<fr.length-8){
-      const type=fr[pos];
-      if(type===0x8A){
-        /* EABI math: skip header+sites */
-        if(pos+13>fr.length)break;
-        const count=frdv.getUint32(pos+9,true);
-        pos+=13+count*3;
-      }else if(type===0x02||type===0x82){
-        /* Flipper SDK entry: 0x02 = standard, 0x82 = flagged variant (same structure) */
-        if(pos+9>fr.length)break;
-        const hash=frdv.getUint32(pos+1,true);
-        const count=frdv.getUint32(pos+5,true);
-        if(count>500){log(`[FAST] bad count ${count} at pos ${pos}, skipping`);pos++;continue;}
-        const fnName=h2n[hash];
-        for(let i=0;i<count;i++){
-          if(pos+9+i*3+2>=fr.length)break;
-          const stubOff=fr[pos+9+i*3]|(fr[pos+9+i*3+1]<<8)|(fr[pos+9+i*3+2]<<16);
-          const stubAddr=LOAD_BASE+stubOff;
-          if(fnName&&stubs[fnName]!==undefined){
-            /* Write our stub address into the PLT slot so the BLX mechanism works */
-            const sb4=new Uint8Array(4);new DataView(sb4.buffer).setUint32(0,stubs[fnName],true);
-            let writeOk=false;
-            try{uc.mem_write(stubAddr,sb4);
-              /* Verify: read back */
-              const rbdata=uc.mem_read(stubAddr,4);
-              const rbv=(rbdata&&rbdata.length>=4)?new DataView(rbdata.buffer,rbdata.byteOffset).getUint32(0,true):0;
-              writeOk=(rbv===stubs[fnName]);
-            }catch(e){log(`[FAST] write err ${fnName}: ${e?.message??String(e)}`);}
-            /* Also hook the address directly as a backup */
-            fastCallSites.push({addr:stubAddr,symName:fnName});
-            log(`[FAST] ${fnName} slot@0x${stubAddr.toString(16)} → stub@0x${stubs[fnName].toString(16)} verify:${writeOk?'OK':'FAIL'}`);resolved++;
-          }else if(fnName===undefined){
-            log(`[FAST] hash 0x${hash.toString(16)} unknown`);
-          }
-        }
-        pos+=9+count*3;
-      }else if(type===0x01||type===0x00){
-        /* Skip padding/alignment bytes */
-        pos++;
-      }else{log(`[FAST] unknown type 0x${type.toString(16)} at pos ${pos} — skipping`);pos++;continue;}
-    }
-    log(`[FAST] resolved ${resolved} SDK slots`);
-  }
-  const entry=hasPhdrs?(fap.eEntry|1):((fap.eEntry+delta)|1);log(`[EMU] Entry: 0x${entry.toString(16)}`);return{entry,callSites,fastCallSites};
+  const entry=hasPhdrs?(fap.eEntry|1):((fap.eEntry+delta)|1);log(`[EMU] Entry: 0x${entry.toString(16)}`);return entry;
 }
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
@@ -622,8 +529,6 @@ function App(){
   const loopRef     =useRef(null);
   const emuStateRef =useRef('idle');
   const watchdogRef =useRef(null);
-  const pendingDrawRef=useRef(false);
-  const waitingInputRef=useRef(false);
 
   const winW=useWindowWidth();
   const mobile=winW<600,tablet=winW<960;
@@ -654,68 +559,41 @@ function App(){
     setError(null);setFap(null);setEmuState('idle');emuStateRef.current='idle';setLogs([]);
     displayRef.current.clear();renderDisplay();
     const reader=new FileReader();
-    reader.onload=e=>{try{
-      const r=parseELF(e.target.result);
-      setFap({...r,fileName:file.name});
-      /* Diagnostic: log all sections and defined symbols */
-      const diagLogs=[];
-      diagLogs.push(`[ELF] type=${r.isDyn?'ET_DYN':'ET_EXEC'} entry=0x${r.eEntry.toString(16)} sections=${r.rawSections.length} phdrs=${r.phdrs?.length??0}`);
-      r.rawSections.filter(s=>s.name&&s.size>0).forEach(s=>diagLogs.push(`[SEC] ${s.name} size=${s.size} addr=0x${s.addr.toString(16)} type=${s.type} flags=${s.flags}`));
-      const defFns=Object.entries(r.definedFns||{});
-      if(defFns.length>0)defFns.forEach(([n,a])=>diagLogs.push(`[SYM] defined: ${n} @ 0x${a.toString(16)}`));
-      else diagLogs.push('[SYM] No interceptable SDK symbols found as defined functions');
-      diagLogs.push(`[SYM] ${r.imports.length} undefined imports, ${r.relSections.length} rel sections`);
-      /* Dump first 64 bytes of .fast.rel.text for format analysis */
-      const fastRel=r.rawSections.find(s=>s.name==='.fast.rel.text');
-      if(fastRel){
-        const u8=new Uint8Array(r.buffer,fastRel.offset,Math.min(fastRel.size,64));
-        const hex=Array.from(u8).map(b=>b.toString(16).padStart(2,'0')).join(' ');
-        diagLogs.push(`[FAST] .fast.rel.text size=${fastRel.size} first 64B: ${hex}`);
-        /* Try parsing as {uint32 count, then count×{uint32 offset, uint32 hash, uint8 flags}} */
-        const dv=new DataView(r.buffer,fastRel.offset,fastRel.size);
-        const cnt=dv.getUint32(0,true);
-        diagLogs.push(`[FAST] count=${cnt} (${fastRel.size-4}/${cnt}=${((fastRel.size-4)/cnt).toFixed(2)} bytes/entry)`);
-      }
-      setLogs(diagLogs);
-    }catch(err){setError(err.message);}};
-
+    reader.onload=e=>{try{const r=parseELF(e.target.result);setFap({...r,fileName:file.name});}catch(err){setError(err.message);}};
     reader.readAsArrayBuffer(file);
   },[renderDisplay]);
 
   const runFAP=useCallback(async()=>{
     if(!fap||!ucReady||!window.uc){addLog('[ERR] Unicorn.js not ready');return;}
-    if(fap.imports.length===0&&Object.keys(fap.definedFns||{}).length===0){
-      addLog('[WARN] No SDK symbols found — binary may be fully stripped. Attempting anyway...');
+    if(fap.imports.length===0){
+      addLog('[ERR] No stubbable imports found — cannot emulate this binary.');
+      setError('No SDK imports detected — this .fap has no Flipper SDK calls FAP EMU can stub. It may be stripped or use a custom runtime.');
+      return;
     }
     setEmuState('running');emuStateRef.current='running';
     setLogs([]);displayRef.current.clear();renderDisplay();
     let commitSeen=false;
     watchdogRef.current=setTimeout(()=>{
       if(emuStateRef.current==='running'&&!commitSeen){
-        addLog('[WARN] No display output after 5s — try pressing OK or UP to trigger a draw callback.');
-        addLog('[WARN] If your app uses ViewPort, make sure draw callback is registered before the event loop.');
-        addLog('[WARN] Check the LOG tab for [DRAW] entries showing when draw callbacks were triggered.');
-        setError('No display output after 5s. Check the LOG for [DRAW] entries. If no draw callback was registered, the app may require RTOS features.');
+        addLog('[WARN] No display output after 5s.');
+        addLog('[WARN] Static binaries call hardware drivers directly — canvas output cannot be intercepted.');
+        addLog('[WARN] If using ViewPort, ensure draw callback is set before gui_add_view_port.');
+        setError('No display output after 30s. Check LOG for [FURI]/[GUI]/[SRD] entries to diagnose.');
       }
       watchdogRef.current=null;
-    },5000);
+    },30000);
     const watchdog=watchdogRef.current;
     try{
       const uc=new window.uc.Unicorn(window.uc.ARCH_ARM,window.uc.MODE_THUMB);
       ucRef.current=uc;
-      pendingDrawRef.current=false;waitingInputRef.current=false;
-      const{stubs,handlers}=buildStubs(displayRef.current,inputQueue,addLog,{
-        onDraw:()=>{pendingDrawRef.current=true;},
-        onWaitInput:(uc_h)=>{waitingInputRef.current=true;pendingDrawRef.current=true;uc_h.emu_stop();}
-      });
-      let stubCallCount=0;
+      const{stubs,handlers}=buildStubs(displayRef.current,inputQueue,addLog);
       uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
         const h=handlers[addr];
-        if(h!==undefined){stubCallCount++;let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e?.message??String(e)}`);ret=0;}if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);const lr=uc_h.reg_read(RP.LR)>>>0;uc_h.reg_write(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
+        if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e?.message??String(e)}`);ret=0;}if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);const lr=uc_h.reg_read(RP.LR)>>>0;uc_h.reg_write(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
         if((uc_h.reg_read(RP.PC)>>>0)===0xFEFEFEFE)uc_h.emu_stop();
       },STUB_BASE,STUB_BASE+0x100000);
       /* HOOK_INTR — log software interrupts (SVC etc) */
-      try{uc.hook_add(window.uc.HOOK_INTR,(uc_h,intno)=>{addLog(`[INT] interrupt #${intno}`);});}catch(e){}
+      let intrCount=0;try{uc.hook_add(window.uc.HOOK_INTR,(uc_h,intno)=>{if(intrCount++<5)addLog(`[INT] interrupt #${intno} (total: ${intrCount})`);});}catch(e){}
       /* EXC_RETURN hook — simulate Cortex-M exception return by popping the hardware frame */
       try{uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
         /* Read 4 bytes from emulated memory */
@@ -729,19 +607,18 @@ function App(){
         uc_h.reg_write(RP.R2,retR2>>>0);uc_h.reg_write(RP.R3,retR3>>>0);
         uc_h.reg_write(RP.LR,retLR>>>0);
         const dst=(retPC>>>0);
-        if(dst===0xFEFEFEFE){
+        if(dst===0xFEFEFEFE||dst===0){
           uc_h.emu_stop();
           emuStateRef.current='idle';
           if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}
-          if(!commitSeen){setError('App exited without drawing. Check LOG for [FURI]/[GUI]/[DRAW] entries.');}
-          else{addLog('[EMU] App exited normally.');}
+          if(!commitSeen){
+            addLog('[WARN] App exited without drawing anything.');
+            addLog('[WARN] App needs more than 50M instructions to init — try pressing OK/UP to trigger draws.');
+            setError('App exited without drawing. Check [FURI]/[GUI]/[DRAW] in LOG, or press OK/UP after RUN.');
+          } else {
+            addLog('[EMU] App exited normally.');
+          }
           setEmuState('idle');
-        } else if(dst===0){
-          /* Frame pop gave PC=0 — Unicorn may not push exception frame; fall back to LR register */
-          const fallback=(uc_h.reg_read(RP.LR)>>>0)&~1;
-          addLog(`[EXC] frame PC=0, fallback LR=0x${fallback.toString(16)}`);
-          if(fallback&&fallback!==0xFEFEFEFE) uc_h.reg_write(RP.PC,(fallback|1)>>>0);
-          else uc_h.reg_write(RP.PC,((uc_h.reg_read(RP.PC)>>>0)+4)>>>0);
         }
         else{uc_h.reg_write(RP.PC,(dst|1)>>>0);}  // resume in THUMB mode
       },0xFFFF0000,0xFFFFFFFF);}catch(e){addLog(`[EXC] hook err: ${e?.message??String(e)}`);}
@@ -758,116 +635,38 @@ function App(){
         if(dynMaps<16){addLog(`[MEM] dyn-map 64KB @ 0x${page.toString(16)} (access 0x${(addr>>>0).toString(16)})`);dynMaps++;}
         return true;
       },1,0xFFFFFFFF);}catch(e){addLog(`[MEM] hook unavailable: ${e?.message??String(e)}`);}
-      /* Static binary: definedFns — merged into csMap above if callSites hook exists,
-         otherwise add a separate range hook */
+      /* Detect if app reads from SDK slot area */
+      let slotReadCount=0;
+      try{uc.hook_add((window.uc.HOOK_MEM_READ??1024),(uc_h,_t,addr)=>{
+        const a=addr>>>0;
+        if(slotReadCount<10){slotReadCount++;const pc=(uc_h.reg_read(RP.PC)>>>0);addLog(`[SRD] slot read 0x${a.toString(16)} from PC=0x${pc.toString(16)}`);}
+      },0x8000900,0x8000e00);}catch(e){addLog(`[SRD] hook err: ${e?.message??String(e)}`);}
+      /* Static binary: hook known SDK functions at their actual addresses */
       const staticFns=fap.definedFns||{};
       const staticCount=Object.keys(staticFns).length;
-      if(staticCount>0&&callSites.length===0){
-        /* No callSites hook yet — add one covering .text for definedFns */
-        const dfMap={};
+      if(staticCount>0){
+        addLog(`[EMU] Intercepting ${staticCount} SDK functions in static binary`);
         for(const[name,addr]of Object.entries(staticFns)){
-          if(stubs[name]!==undefined&&handlers[stubs[name]])dfMap[addr>>>0]={name,isDF:true};
-        }
-        addLog(`[EMU] Intercepting ${Object.keys(dfMap).length} defined SDK functions`);
-        uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
-          const e=dfMap[addr>>>0];if(!e)return;
-          const handler=handlers[stubs[e.name]];
-          let ret;try{ret=handler(uc_h);}catch(er){ret=0;}
-          if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
-          if(e.name==='canvas_commit'){commitSeen=true;renderDisplay();}
-          const lr=(uc_h.reg_read(RP.LR)>>>0)&~1;
-          uc_h.reg_write(RP.PC,lr?lr:0xFEFEFEFE);
-        },LOAD_BASE,LOAD_BASE+4*1024*1024);
-      } else if(staticCount>0){
-        /* Merge definedFns into the existing csMap (re-add hook) — handled below */
-      }
-      /* triggerDraw: call the registered draw callback with a fake canvas */
-      const triggerDraw=()=>{
-        const cb=stubs._getVPDraw(),ctx=stubs._getVPCtx();
-        if(!cb){addLog('[DRAW] no draw callback registered yet');return;}
-        const sv=[RP.R0,RP.R1,RP.R2,RP.R3,RP.LR,RP.PC,RP.SP].map(r=>[r,uc.reg_read(r)>>>0]);
-        uc.reg_write(RP.R0,CANVAS_FAKE);uc.reg_write(RP.R1,ctx>>>0);uc.reg_write(RP.LR,0xFEFEFEFE);
-        addLog(`[DRAW] calling draw_cb @ 0x${cb.toString(16)}`);
-        try{uc.emu_start(cb|1,0xFEFEFEFE,0,1000000);commitSeen=true;renderDisplay();}catch(e){addLog(`[DRAW] err: ${e?.message??String(e)}`);}
-        sv[0].forEach(([r,v])=>uc.reg_write(r,v));
-      };
-      const{entry,callSites,fastCallSites}=loadFAP(uc,fap,stubs,addLog);
-      /* Combined hook: .rel.text call sites (skip BL, PC+4) +
-         .fast.rel.text entry points (return via LR) */
-      {
-        const csMap={};  // BL call sites — skip instruction (PC+4)
-        const fastMap={};// FAST entry points — return via LR
-        for(const{addr,symName}of callSites){
-          if(stubs[symName]!==undefined&&handlers[stubs[symName]])csMap[addr>>>0]=symName;
-        }
-        for(const{addr,symName}of (fastCallSites||[])){
-          if(stubs[symName]!==undefined&&handlers[stubs[symName]])fastMap[addr>>>0]=symName;
-        }
-        const csCount=Object.keys(csMap).length,fcCount=Object.keys(fastMap).length;
-        addLog(`[EMU] Hooking ${csCount} BL sites + ${fcCount} FAST entry points`);
-        uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
-          const ua=addr>>>0;
-          /* Check BL call-site map first (skip 4 bytes) */
-          let symName=csMap[ua];
-          if(symName!==undefined){
-            const handler=handlers[stubs[symName]];
+          const stubAddr=stubs[name];
+          if(stubAddr===undefined)continue;
+          const handler=handlers[stubAddr];
+          if(!handler)continue;
+          uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
             let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
             if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
-            if(symName==='canvas_commit'){commitSeen=true;renderDisplay();}
-            if(symName==='view_port_update'||symName==='gui_add_view_port'){pendingDrawRef.current=true;}
-            uc_h.reg_write(RP.PC,(ua+4)>>>0);
-            return;
-          }
-          /* Check FAST entry-point map (return via LR) */
-          symName=fastMap[ua];
-          if(symName!==undefined){
-            const handler=handlers[stubs[symName]];
-            let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
-            if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
-            if(symName==='canvas_commit'){commitSeen=true;renderDisplay();}
-            if(symName==='view_port_update'||symName==='gui_add_view_port'){pendingDrawRef.current=true;}
+            if(name==='canvas_commit'){commitSeen=true;renderDisplay();}
             const lr=(uc_h.reg_read(RP.LR)>>>0)&~1;
-            uc_h.reg_write(RP.PC,lr||0xFEFEFEFE);
-            return;
-          }
-        },LOAD_BASE,LOAD_BASE+4*1024*1024);
-      }
-      /* Re-emit .fast.rel.text using pre-stored bytes (avoids ArrayBuffer lookup) */
-      if(fap.fastRelBytes&&fap.fastRelBytes.length>0){
-        const hex=fap.fastRelBytes.slice(0,80).map(b=>b.toString(16).padStart(2,'0')).join(' ');
-        addLog(`[FAST] size=${fap.fastRelBytes.length} bytes: ${hex}`);
-        const dv=new DataView(new Uint8Array(fap.fastRelBytes).buffer);
-        const cnt=dv.getUint32(0,true);
-        addLog(`[FAST] count=${cnt} entry_size=${((fap.fastRelBytes.length-4)/cnt).toFixed(2)}`);
-      }else{addLog('[FAST] no .fast.rel.text section found');}
-      addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
-      /* Watch for writes to the SDK slot area during execution */
-      const SLOT_START=0x8000000+0xc00,SLOT_END=0x8000000+0xe00;
-      let slotOverwrites=0;
-      try{uc.hook_add((window.uc.HOOK_MEM_WRITE??2048),(uc_h,_type,addr,size,val)=>{
-        const a=addr>>>0;
-        if(a>=SLOT_START&&a<SLOT_END){
-          slotOverwrites++;
-          const pc=(uc_h.reg_read(RP.PC)>>>0);
-          if(slotOverwrites<=10)addLog(`[OVW] slot 0x${a.toString(16)} ← 0x${(val>>>0).toString(16)} from PC=0x${pc.toString(16)}`);
+            uc_h.reg_write(RP.PC,lr?lr:0xFEFEFEFE);
+          },addr,addr);
         }
-      },SLOT_START,SLOT_END);}catch(e){addLog(`[OVW] hook failed: ${e?.message??String(e)}`);}
-      try{uc.emu_start(entry,0xFEFEFEFE,0,2000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
-      addLog(`[EMU] init done — ${stubCallCount} stub calls, ${slotOverwrites} slot overwrites, pendingDraw=${pendingDrawRef.current}`);
-      /* Read back key slots to see if they survived */
-      [[0x8000d04,'furi_record_open'],[0x8000d0c,'gui_add_view_port'],[0x8000d14,'view_port_draw_callback_set'],[0x8000d28,'furi_message_queue_get']].forEach(([addr,name])=>{
-        try{const d=uc.mem_read(addr,4);const v=d&&d.length>=4?new DataView(d.buffer,d.byteOffset).getUint32(0,true):0;addLog(`[CHK] ${name} slot=0x${v.toString(16)}`);}catch(e){}
-      });
+      }
+      const entry=loadFAP(uc,fap,stubs,addLog);
+      addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
+      try{uc.emu_start(entry,0xFEFEFEFE,0,50000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
       renderDisplay();
       const tick=()=>{
         if(emuStateRef.current!=='running'){loopRef.current=null;return;}
-        if(pendingDrawRef.current){pendingDrawRef.current=false;triggerDraw();}
-        if(!waitingInputRef.current){
-          try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,5000);renderDisplay();}catch(e){if(emuStateRef.current==='running')addLog(`[ERR] tick: ${e?.message??String(e)}`);}
-        }else{
-          if(inputQueue.current.length>0){waitingInputRef.current=false;try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,50000);renderDisplay();}catch(e){}}
-          else renderDisplay();
-        }
+        try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,100000);renderDisplay();}catch(e){if(emuStateRef.current==='running')addLog(`[ERR] tick: ${e?.message??String(e)}`);}
         loopRef.current=requestAnimationFrame(tick);
       };
       loopRef.current=requestAnimationFrame(tick);
