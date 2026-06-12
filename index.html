@@ -78,7 +78,7 @@ function parseELF(buffer){
   if(dynsym&&dynstr)parseSym(dynsym,dynstr);
   if(symtab&&strtab)parseSym(symtab,strtab);
   /* Also extract DEFINED SDK function addresses for static binary interception */
-  const SDK_FNS=new Set(['canvas_commit','canvas_clear','canvas_set_font','canvas_set_color','canvas_draw_str','canvas_draw_str_aligned','canvas_draw_dot','canvas_draw_line','canvas_draw_frame','canvas_draw_box','canvas_draw_circle','canvas_draw_disc','canvas_draw_icon','canvas_draw_xbm','canvas_width','canvas_height','view_port_alloc','view_port_free','view_port_enabled_set','view_port_draw_callback_set','view_port_input_callback_set','view_port_update','gui_add_view_port','gui_remove_view_port','furi_delay_ms','furi_delay_tick','furi_thread_yield','furi_record_open','furi_record_close','malloc','free','calloc','realloc','furi_message_queue_alloc','furi_message_queue_put','furi_message_queue_get','furi_message_queue_free','furi_semaphore_alloc','furi_semaphore_acquire','furi_semaphore_release','furi_semaphore_free','furi_mutex_alloc','furi_mutex_acquire','furi_mutex_release','furi_mutex_free']);
+  const SDK_FNS=new Set(['canvas_commit','canvas_clear','canvas_set_font','canvas_set_color','canvas_draw_str','canvas_draw_str_aligned','canvas_draw_dot','canvas_draw_line','canvas_draw_frame','canvas_draw_box','canvas_draw_circle','canvas_draw_disc','canvas_draw_icon','canvas_draw_xbm','canvas_width','canvas_height','view_port_alloc','view_port_free','view_port_enabled_set','view_port_draw_callback_set','view_port_input_callback_set','view_port_update','gui_add_view_port','gui_remove_view_port','furi_delay_ms','furi_delay_tick','furi_thread_yield','furi_record_open','furi_record_close','malloc','free','calloc','realloc','furi_message_queue_alloc','furi_message_queue_put','furi_message_queue_get','furi_message_queue_free','furi_semaphore_alloc','furi_semaphore_acquire','furi_semaphore_release','furi_semaphore_free','furi_mutex_alloc','furi_mutex_acquire','furi_mutex_release','furi_mutex_free','furi_ms_to_ticks','__wrap_snprintf']);
   const definedFns={};
   if(symtab&&strtab){const ent=symtab.entsize||16,cnt=Math.floor(symtab.size/ent);for(let i=1;i<cnt;i++){const o=symtab.offset+i*ent,ni=view.getUint32(o,le),val=view.getUint32(o+4,le),info=u8[o+12],shndx=view.getUint16(o+14,le),name=rs(strtab.offset+ni);if(shndx!==SHN_UNDEF&&shndx!==0xFFFF&&val>0&&(info&0xf)===2&&SDK_FNS.has(name))definedFns[name]=val;}}
   const rodata=shdrs.find(s=>s.name==='.rodata');
@@ -316,7 +316,8 @@ function buildStubs(display,inputQueueRef,logFn){
   reg('strlen',   (uc)=>rs(uc,rr(uc,0)).length);
   reg('strcmp',   (uc)=>{const a=rs(uc,rr(uc,0)),b=rs(uc,rr(uc,1));return a<b?-1:a>b?1:0;});
   reg('strncmp',  ()=>0); reg('strcpy',(uc)=>rr(uc,0)); reg('strncpy',(uc)=>rr(uc,0));
-  reg('strcat',   (uc)=>rr(uc,0)); reg('sprintf',()=>0); reg('snprintf',()=>0); reg('printf',()=>0);
+  reg('strcat',   (uc)=>rr(uc,0)); reg('sprintf',()=>0); reg('snprintf',()=>0); reg('__wrap_snprintf',()=>0); reg('printf',()=>0);
+  reg('furi_ms_to_ticks',(uc)=>rr(uc,0)); /* 1ms = 1 tick on Flipper (1kHz scheduler) */
 
   /* Timer */
   reg('furi_timer_alloc', (uc)=>mm(uc,32)); reg('furi_timer_free',()=>{});
