@@ -26,6 +26,10 @@ const GB_ON=[15,56,15],GB_OFF=[155,188,15];
 const LOAD_BASE=0x08000000,RAM_BASE=0x20000000;
 const HEAP_BASE=0x20010000,STACK_TOP=0x20030000,STUB_BASE=0x40000000;
 const RP={R0:66,R1:67,R2:68,R3:69,R12:78,SP:13,LR:11,PC:12};
+const CANVAS_FAKE=0x20001000;
+function djb2(s){let h=5381;for(let i=0;i<s.length;i++)h=(((h<<5)+h)+s.charCodeAt(i))&0xFFFFFFFF;return h>>>0;}
+const ALL_SDK_NAMES=['canvas_commit','canvas_clear','canvas_set_font','canvas_set_color','canvas_draw_str','canvas_draw_str_aligned','canvas_draw_dot','canvas_draw_line','canvas_draw_frame','canvas_draw_box','canvas_draw_rbox','canvas_draw_rframe','canvas_draw_circle','canvas_draw_disc','canvas_draw_icon','canvas_draw_xbm','canvas_draw_bitmap','canvas_width','canvas_height','canvas_invert_color','canvas_get_font_params','view_port_alloc','view_port_free','view_port_enabled_set','view_port_draw_callback_set','view_port_input_callback_set','view_port_update','gui_add_view_port','gui_remove_view_port','gui_get_framebuffer_size','furi_delay_ms','furi_delay_tick','furi_thread_yield','furi_record_open','furi_record_close','malloc','free','calloc','realloc','furi_message_queue_alloc','furi_message_queue_put','furi_message_queue_get','furi_message_queue_free','furi_semaphore_alloc','furi_semaphore_acquire','furi_semaphore_release','furi_semaphore_free','furi_mutex_alloc','furi_mutex_acquire','furi_mutex_release','furi_mutex_free','furi_ms_to_ticks','__wrap_snprintf','__errno','furi_timer_alloc','furi_timer_free','furi_timer_start','furi_timer_stop','view_alloc','view_free','view_set_draw_callback','view_set_input_callback','view_dispatcher_alloc','view_dispatcher_free','view_dispatcher_enable_queue','view_dispatcher_attach_to_gui','view_dispatcher_run','view_dispatcher_stop','view_dispatcher_add_view','view_dispatcher_remove_view','view_dispatcher_switch_to_view','view_dispatcher_send_custom_event','view_dispatcher_set_event_callback_context','view_dispatcher_set_custom_event_callback','view_dispatcher_set_navigation_event_callback','view_dispatcher_set_tick_event_callback','infrared_send','infrared_get_protocol_address_length','infrared_get_protocol_command_length','infrared_get_protocol_name','infrared_alloc','infrared_free','infrared_signal_alloc','infrared_signal_free','furi_hal_infrared_async_tx_start','furi_hal_infrared_async_tx_stop','furi_hal_infrared_is_busy','furi_string_alloc','furi_string_free','notification_message','notification_message_block'];
+const SDK_HASHMAP={};ALL_SDK_NAMES.forEach(n=>{SDK_HASHMAP[djb2(n)]=n;});
 const EM_ARM=40,SHN_UNDEF=0;
 const InputKey={Up:0,Down:1,Left:2,Right:3,Ok:4,Back:5};
 const InputType={Press:0,Release:1,Short:2};
@@ -144,7 +148,7 @@ class FlipperDisplay{
 }
 
 /* ── Stubs (Phase 3: ViewDispatcher, View, SceneManager, Widgets) ──────── */
-function buildStubs(display,inputQueueRef,logFn){
+function buildStubs(display,inputQueueRef,logFn,cb={}){const{onDraw,onWaitInput}=cb;
   const stubs={},handlers={};let nextAddr=STUB_BASE;
   const log=logFn||(()=>{});
   function reg(name,fn){stubs[name]=nextAddr;handlers[nextAddr]=fn;nextAddr+=4;}
@@ -185,11 +189,11 @@ function buildStubs(display,inputQueueRef,logFn){
   reg('view_port_enabled_set',        ()=>{});
   reg('view_port_draw_callback_set',  (uc)=>{vpDraw=rr(uc,1);vpCtx=rr(uc,2);log(`[VP] draw_cb=0x${rr(uc,1).toString(16)}`);});
   reg('view_port_input_callback_set', (uc)=>{vpInput=rr(uc,1);log(`[VP] input_cb=0x${rr(uc,1).toString(16)}`);});
-  reg('view_port_update',             ()=>{});
+  reg('view_port_update',             ()=>{onDraw?.();});
   stubs._getVPDraw=()=>vpDraw;stubs._getVPInput=()=>vpInput;stubs._getVPCtx=()=>vpCtx;
 
   /* GUI */
-  reg('gui_add_view_port',         ()=>log('[GUI] viewport added'));
+  reg('gui_add_view_port',         ()=>{log('[GUI] viewport added');onDraw?.();});
   reg('gui_remove_view_port',      ()=>{});
   reg('gui_get_framebuffer_size',  ()=>1024);
 
@@ -199,7 +203,7 @@ function buildStubs(display,inputQueueRef,logFn){
   reg('view_dispatcher_free',                         ()=>{});
   reg('view_dispatcher_enable_queue',                 ()=>{});
   reg('view_dispatcher_attach_to_gui',                ()=>log('[VD] attached to GUI'));
-  reg('view_dispatcher_run',                          ()=>log('[VD] run() — event loop started'));
+  reg('view_dispatcher_run',                          ()=>{log('[VD] run() — event loop');onDraw?.();});
   reg('view_dispatcher_stop',                         ()=>{});
   reg('view_dispatcher_add_view',                     ()=>{});
   reg('view_dispatcher_remove_view',                  ()=>{});
@@ -303,6 +307,8 @@ function buildStubs(display,inputQueueRef,logFn){
   reg('menu_get_view',  (uc)=>mm(uc,64));
 
   /* Memory */
+  reg('furi_record_open', (uc)=>{const n=rs(uc,rr(uc,0));log(`[FURI] record_open("${n}")`);return 0x20000200;});
+  reg('furi_record_close',()=>{});
   reg('malloc',    (uc)=>mm(uc,rr(uc,0)));
   reg('calloc',    (uc)=>mm(uc,rr(uc,0)*rr(uc,1)));
   reg('realloc',   (uc)=>mm(uc,rr(uc,1)));
@@ -338,7 +344,7 @@ function buildStubs(display,inputQueueRef,logFn){
   reg('furi_message_queue_alloc',(uc)=>mm(uc,64));
   reg('furi_message_queue_free',()=>{});
   reg('furi_message_queue_put',()=>0);
-  reg('furi_message_queue_get',(uc)=>{const q=inputQueueRef.current;if(q.length>0){const evt=q.shift();const buf=rr(uc,1);if(buf)w32(uc,buf,evt.key|(evt.type<<8));return 0;}return 5;});
+  reg('furi_message_queue_get',(uc)=>{const q=inputQueueRef.current;if(q.length>0){const evt=q.shift();const buf=rr(uc,1);if(buf)w32(uc,buf,evt.key|(evt.type<<8));onDraw?.();return 0;}onWaitInput?.(uc);return 5;});
 
   /* Thread */
   reg('furi_thread_alloc',(uc)=>mm(uc,64)); reg('furi_thread_free',()=>{});
@@ -530,6 +536,8 @@ function App(){
   const loopRef     =useRef(null);
   const emuStateRef =useRef('idle');
   const watchdogRef =useRef(null);
+  const pendingDrawRef=useRef(false);
+  const waitingInputRef=useRef(false);
 
   const winW=useWindowWidth();
   const mobile=winW<600,tablet=winW<960;
@@ -560,7 +568,37 @@ function App(){
     setError(null);setFap(null);setEmuState('idle');emuStateRef.current='idle';setLogs([]);
     displayRef.current.clear();renderDisplay();
     const reader=new FileReader();
-    reader.onload=e=>{try{const r=parseELF(e.target.result);setFap({...r,fileName:file.name});}catch(err){setError(err.message);}};
+    reader.onload=e=>{try{
+      const r=parseELF(e.target.result);
+      setFap({...r,fileName:file.name});
+      const diag=[];
+      diag.push(`[ELF] type=${r.isDyn?'ET_DYN':'ET_EXEC'} entry=0x${r.eEntry.toString(16)} sections=${r.rawSections.length} phdrs=${r.phdrs?.length??0}`);
+      diag.push(`[ELF] ${r.imports.length} imports, ${Object.keys(r.definedFns||{}).length} defined SDK fns matched`);
+      /* Scan .fast.rel.text (and similarly-named sections) for djb2 hash matches at every byte offset */
+      const u8all=new Uint8Array(r.buffer);
+      const dv=new DataView(r.buffer);
+      r.rawSections.filter(s=>s.name.includes('fast')&&s.size>0).forEach(sec=>{
+        diag.push(`[FAST] section ${sec.name} size=${sec.size} @file-offset=0x${sec.offset.toString(16)}`);
+        const matches=[];
+        for(let i=0;i<=sec.size-4;i++){
+          const val=dv.getUint32(sec.offset+i,true);
+          const name=SDK_HASHMAP[val];
+          if(name){
+            const next8=Array.from(u8all.slice(sec.offset+i+4,sec.offset+i+12)).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+            matches.push(`pos ${i}: ${name} (0x${val.toString(16)}) next8=[${next8}]`);
+          }
+        }
+        diag.push(`[FAST] ${matches.length} hash matches found`);
+        matches.forEach(m=>diag.push(`[FAST] ${m}`));
+        /* Full hex dump in 32-byte chunks */
+        for(let off=0;off<sec.size;off+=32){
+          const chunk=u8all.slice(sec.offset+off,sec.offset+Math.min(off+32,sec.size));
+          const hex=Array.from(chunk).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+          diag.push(`[HEX ${off.toString(16).padStart(4,'0')}] ${hex}`);
+        }
+      });
+      setLogs(diag);
+    }catch(err){setError(err.message);}};
     reader.readAsArrayBuffer(file);
   },[renderDisplay]);
 
@@ -587,7 +625,11 @@ function App(){
     try{
       const uc=new window.uc.Unicorn(window.uc.ARCH_ARM,window.uc.MODE_THUMB);
       ucRef.current=uc;
-      const{stubs,handlers}=buildStubs(displayRef.current,inputQueue,addLog);
+      pendingDrawRef.current=false;waitingInputRef.current=false;
+      const{stubs,handlers}=buildStubs(displayRef.current,inputQueue,addLog,{
+        onDraw:()=>{pendingDrawRef.current=true;},
+        onWaitInput:(uc_h)=>{waitingInputRef.current=true;pendingDrawRef.current=true;uc_h.emu_stop();}
+      });
       uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
         const h=handlers[addr];
         if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e?.message??String(e)}`);ret=0;}if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);const lr=uc_h.reg_read(RP.LR)>>>0;uc_h.reg_write(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
@@ -608,18 +650,22 @@ function App(){
         uc_h.reg_write(RP.R2,retR2>>>0);uc_h.reg_write(RP.R3,retR3>>>0);
         uc_h.reg_write(RP.LR,retLR>>>0);
         const dst=(retPC>>>0);
-        if(dst===0xFEFEFEFE||dst===0){
+        if(dst===0xFEFEFEFE){
           uc_h.emu_stop();
           emuStateRef.current='idle';
           if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}
           if(!commitSeen){
             addLog('[WARN] App exited without drawing anything.');
-            addLog('[WARN] App needs more than 50M instructions to init — try pressing OK/UP to trigger draws.');
             setError('App exited without drawing. Check [FURI]/[GUI]/[DRAW] in LOG, or press OK/UP after RUN.');
           } else {
             addLog('[EMU] App exited normally.');
           }
           setEmuState('idle');
+        } else if(dst===0){
+          /* Frame pop gave PC=0 — fall back to LR register */
+          const fb=(uc_h.reg_read(RP.LR)>>>0)&~1;
+          if(fb&&fb!==0xFEFEFEFE){uc_h.reg_write(RP.PC,(fb|1)>>>0);}
+          else{uc_h.reg_write(RP.PC,((uc_h.reg_read(RP.PC)>>>0)+4)>>>0);}
         }
         else{uc_h.reg_write(RP.PC,(dst|1)>>>0);}  // resume in THUMB mode
       },0xFFFF0000,0xFFFFFFFF);}catch(e){addLog(`[EXC] hook err: ${e?.message??String(e)}`);}
@@ -662,12 +708,28 @@ function App(){
         }
       }
       const entry=loadFAP(uc,fap,stubs,addLog);
+      /* triggerDraw: invoke the app's registered draw callback with a fake canvas */
+      const triggerDraw=()=>{
+        const cb=stubs._getVPDraw?.(),ctx=stubs._getVPCtx?.();
+        if(!cb){return;}
+        const saved=[RP.R0,RP.R1,RP.R2,RP.R3,RP.LR,RP.PC,RP.SP].map(r=>[r,uc.reg_read(r)>>>0]);
+        uc.reg_write(RP.R0,CANVAS_FAKE);uc.reg_write(RP.R1,(ctx||0)>>>0);uc.reg_write(RP.LR,0xFEFEFEFE);
+        addLog(`[DRAW] calling draw_cb @ 0x${cb.toString(16)}`);
+        try{uc.emu_start((cb|1)>>>0,0xFEFEFEFE,0,1000000);commitSeen=true;renderDisplay();}catch(e){addLog(`[DRAW] err: ${e?.message??String(e)}`);}
+        saved.forEach(([r,v])=>{try{uc.reg_write(r,v);}catch(e){}});
+      };
       addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
       try{uc.emu_start(entry,0xFEFEFEFE,0,50000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
       renderDisplay();
       const tick=()=>{
         if(emuStateRef.current!=='running'){loopRef.current=null;return;}
-        try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,100000);renderDisplay();}catch(e){if(emuStateRef.current==='running')addLog(`[ERR] tick: ${e?.message??String(e)}`);}
+        if(pendingDrawRef.current){pendingDrawRef.current=false;triggerDraw();}
+        if(!waitingInputRef.current){
+          try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,100000);renderDisplay();}catch(e){if(emuStateRef.current==='running')addLog(`[ERR] tick: ${e?.message??String(e)}`);}
+        }else if(inputQueue.current.length>0){
+          waitingInputRef.current=false;
+          try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,100000);renderDisplay();}catch(e){}
+        }
         loopRef.current=requestAnimationFrame(tick);
       };
       loopRef.current=requestAnimationFrame(tick);
