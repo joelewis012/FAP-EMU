@@ -648,8 +648,7 @@ function App(){
     let commitSeen=false;
     watchdogRef.current=setTimeout(()=>{
       if(emuStateRef.current==='running'&&!commitSeen){
-        addLog('[WARN] No display output after 5s.');
-        addLog('[WARN] Static binaries call hardware drivers directly — canvas output cannot be intercepted.');
+        addLog('[WARN] No display output after 30s.');
         addLog('[WARN] If using ViewPort, ensure draw callback is set before gui_add_view_port.');
         setError('No display output after 30s. Check LOG for [FURI]/[GUI]/[SRD] entries to diagnose.');
       }
@@ -672,7 +671,9 @@ function App(){
       /* HOOK_INTR — log software interrupts (SVC etc) */
       let intrCount=0;try{uc.hook_add(window.uc.HOOK_INTR,(uc_h,intno)=>{if(intrCount++<5)addLog(`[INT] interrupt #${intno} (total: ${intrCount})`);});}catch(e){}
       /* EXC_RETURN hook — simulate Cortex-M exception return by popping the hardware frame */
+      let excHookCount=0;
       try{uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
+        excHookCount++;
         /* Read 4 bytes from emulated memory */
         const r32=(a)=>{try{const d=uc_h.mem_read(a>>>0,4);if(d&&d.length>=4)return new DataView(d.buffer,d.byteOffset).getUint32(0,true);}catch(e){}return 0;};
         const sp=(uc_h.reg_read(RP.SP)>>>0);
@@ -684,6 +685,8 @@ function App(){
         uc_h.reg_write(RP.R2,retR2>>>0);uc_h.reg_write(RP.R3,retR3>>>0);
         uc_h.reg_write(RP.LR,retLR>>>0);
         const dst=(retPC>>>0);
+        if(excHookCount<=5)addLog(`[EXC] #${excHookCount} sp=0x${sp.toString(16)} dst=0x${dst.toString(16)} lr=0x${retLR.toString(16)}`);
+        if(excHookCount===200)addLog('[EXC] suppressing further [EXC] logs (200 reached)');
         if(dst===0xFEFEFEFE){
           uc_h.emu_stop();
           emuStateRef.current='idle';
@@ -742,12 +745,15 @@ function App(){
         }
       }
       const{entry,callSites}=loadFAP(uc,fap,stubs,addLog);
+      let callSiteHits=0;const callSiteFirstHits=[];
       if(callSites.length>0){
         addLog(`[EMU] Hooking ${callSites.length} call sites (.rel.text + .fast.rel.text)`);
         for(const{addr,symName}of callSites){
           const stubAddr=stubs[symName];if(stubAddr===undefined)continue;
           const handler=handlers[stubAddr];if(!handler)continue;
           uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
+            callSiteHits++;
+            if(callSiteFirstHits.length<10)callSiteFirstHits.push(`${symName}@0x${addr.toString(16)}`);
             let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
             if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
             if(symName==='canvas_commit'){commitSeen=true;renderDisplay();}
@@ -767,6 +773,10 @@ function App(){
       };
       addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
       try{uc.emu_start(entry,0xFEFEFEFE,0,50000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
+      try{
+        const finalPC=(uc.reg_read(RP.PC)>>>0),finalSP=(uc.reg_read(RP.SP)>>>0);
+        addLog(`[EMU] init done — PC=0x${finalPC.toString(16)} SP=0x${finalSP.toString(16)} excHooks=${excHookCount} callSiteHits=${callSiteHits} [${callSiteFirstHits.join(', ')}] commitSeen=${commitSeen} pendingDraw=${pendingDrawRef.current}`);
+      }catch(e){}
       renderDisplay();
       const tick=()=>{
         if(emuStateRef.current!=='running'){loopRef.current=null;return;}
