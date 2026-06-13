@@ -411,6 +411,7 @@ function loadFAP(uc,fap,stubs,log){
     ls(textSec);ls(sec('.rodata'));ls(sec('.data'));ls(sec('.got'));ls(sec('.got.plt'));
     const bss=sec('.bss');if(bss){const dst=bss.addr+delta;const isW=(bss.flags&1)!==0;const t=(isW&&dst>=LOAD_BASE&&dst<textEnd)?RAM_BASE+(dst-LOAD_BASE):dst;try{uc.mem_write(t,new Uint8Array(bss.size));}catch(e){}}
   }
+  const callSites=[];
   for(const rel of fap.relSections){
     const hasA=rel.name.startsWith('.rela'),ent=hasA?12:8,cnt=Math.floor(rel.size/ent);
     /* Use the rel section's link field to find its symbol table, then that symtab's link for the string table */
@@ -423,10 +424,43 @@ function loadFAP(uc,fap,stubs,log){
       if(relType===21||relType===22){stubs._regUnknown(symName);const sa=stubs[symName];if(sa!==undefined){w32(offset,sa);log(`[REL] ${symName}`);}}
       else if(relType===23){w32(offset,LOAD_BASE+addend);}
       else if(relType===2){try{const cur=view.getUint32(offset,le);w32(offset,cur+(LOAD_BASE-baseVA));}catch(e){}}
+      else if((relType===10||relType===28)&&symName){
+        /* R_ARM_THM_CALL/CALL — BL to undefined symbol; hook the call site directly */
+        stubs._regUnknown(symName);
+        callSites.push({addr:offset,symName});
+        log(`[REL] CALL ${symName} @ 0x${offset.toString(16)}`);
+      }
     }
   }
+  /* ── .fast.rel.text — Flipper's hash-based relocation table ──────────────
+     Format per entry: 4B djb2(name) + 4B count(N) + N*3B little-endian
+     .text-relative offsets + 1 trailer byte. Entries are separated by
+     variable-length jump-table data which we skip by scanning every byte
+     position for the next valid hash match. */
+  for(const fsec of fap.rawSections.filter(s=>s.name.includes('fast')&&s.size>0)){
+    let resolved=0;
+    for(let i=0;i<=fsec.size-8;i++){
+      const hash=view.getUint32(fsec.offset+i,le);
+      const symName=SDK_HASHMAP[hash];
+      if(!symName)continue;
+      const count=view.getUint32(fsec.offset+i+4,le);
+      if(count<1||count>8)continue;
+      if(i+8+count*3>fsec.size)continue;
+      stubs._regUnknown(symName);
+      for(let k=0;k<count;k++){
+        const o=fsec.offset+i+8+k*3;
+        const off=u8[o]|(u8[o+1]<<8)|(u8[o+2]<<16);
+        if(off>=fap.textSize)continue;
+        const addr=(LOAD_BASE+off)>>>0;
+        callSites.push({addr,symName});
+      }
+      resolved++;
+      i+=8+count*3-1; /* skip past this entry */
+    }
+    log(`[FAST] ${fsec.name}: resolved ${resolved} SDK call-site groups`);
+  }
   uc.reg_write(RP.SP,STACK_TOP);uc.reg_write(RP.LR,0xFEFEFEFE);
-  const entry=hasPhdrs?(fap.eEntry|1):((fap.eEntry+delta)|1);log(`[EMU] Entry: 0x${entry.toString(16)}`);return entry;
+  const entry=hasPhdrs?(fap.eEntry|1):((fap.eEntry+delta)|1);log(`[EMU] Entry: 0x${entry.toString(16)}`);return{entry,callSites};
 }
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
@@ -707,7 +741,20 @@ function App(){
           },addr,addr);
         }
       }
-      const entry=loadFAP(uc,fap,stubs,addLog);
+      const{entry,callSites}=loadFAP(uc,fap,stubs,addLog);
+      if(callSites.length>0){
+        addLog(`[EMU] Hooking ${callSites.length} call sites (.rel.text + .fast.rel.text)`);
+        for(const{addr,symName}of callSites){
+          const stubAddr=stubs[symName];if(stubAddr===undefined)continue;
+          const handler=handlers[stubAddr];if(!handler)continue;
+          uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
+            let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
+            if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
+            if(symName==='canvas_commit'){commitSeen=true;renderDisplay();}
+            uc_h.reg_write(RP.PC,((uc_h.reg_read(RP.PC)>>>0)+4)>>>0); /* skip BL/BLX */
+          },addr,addr);
+        }
+      }
       /* triggerDraw: invoke the app's registered draw callback with a fake canvas */
       const triggerDraw=()=>{
         const cb=stubs._getVPDraw?.(),ctx=stubs._getVPCtx?.();
