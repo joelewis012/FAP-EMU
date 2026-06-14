@@ -676,6 +676,7 @@ function App(){
         excHookCount++;
         /* Read 4 bytes from emulated memory */
         const r32=(a)=>{try{const d=uc_h.mem_read(a>>>0,4);if(d&&d.length>=4)return new DataView(d.buffer,d.byteOffset).getUint32(0,true);}catch(e){}return 0;};
+        const hookPC=(uc_h.reg_read(RP.PC)>>>0);
         const sp=(uc_h.reg_read(RP.SP)>>>0);
         /* Cortex-M exception frame: R0,R1,R2,R3,R12,LR,PC,xPSR at SP..SP+31 */
         const retR0=r32(sp),retR1=r32(sp+4),retR2=r32(sp+8),retR3=r32(sp+12);
@@ -685,7 +686,7 @@ function App(){
         uc_h.reg_write(RP.R2,retR2>>>0);uc_h.reg_write(RP.R3,retR3>>>0);
         uc_h.reg_write(RP.LR,retLR>>>0);
         const dst=(retPC>>>0);
-        if(excHookCount<=5)addLog(`[EXC] #${excHookCount} sp=0x${sp.toString(16)} dst=0x${dst.toString(16)} lr=0x${retLR.toString(16)}`);
+        if(excHookCount<=5)addLog(`[EXC] #${excHookCount} hookPC=0x${hookPC.toString(16)} sp=0x${sp.toString(16)} dst=0x${dst.toString(16)} lr=0x${retLR.toString(16)}`);
         if(excHookCount===200)addLog('[EXC] suppressing further [EXC] logs (200 reached)');
         if(dst===0xFEFEFEFE){
           uc_h.emu_stop();
@@ -745,6 +746,10 @@ function App(){
         }
       }
       const{entry,callSites}=loadFAP(uc,fap,stubs,addLog);
+      try{
+        const preSP=(uc.reg_read(RP.SP)>>>0),prePC=(uc.reg_read(RP.PC)>>>0),preLR=(uc.reg_read(RP.LR)>>>0);
+        addLog(`[EMU] pre-run regs — SP=0x${preSP.toString(16)} PC=0x${prePC.toString(16)} LR=0x${preLR.toString(16)} entry=0x${entry.toString(16)}`);
+      }catch(e){addLog(`[EMU] pre-run reg read err: ${e?.message??String(e)}`);}
       let callSiteHits=0;const callSiteFirstHits=[];
       if(callSites.length>0){
         addLog(`[EMU] Hooking ${callSites.length} call sites (.rel.text + .fast.rel.text)`);
