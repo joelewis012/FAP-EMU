@@ -25,7 +25,7 @@ const LCD_W=128,LCD_H=64;
 const GB_ON=[15,56,15],GB_OFF=[155,188,15];
 const LOAD_BASE=0x08000000,RAM_BASE=0x20000000;
 const HEAP_BASE=0x20010000,STACK_TOP=0x20030000,STUB_BASE=0x40000000;
-const RP={R0:66,R1:67,R2:68,R3:69,R12:78,SP:13,LR:11,PC:12};
+const RP={R0:66,R1:67,R2:68,R3:69,R12:78,LR:10,PC:11,SP:12};
 const CANVAS_FAKE=0x20001000;
 function djb2(s){let h=5381;for(let i=0;i<s.length;i++)h=(((h<<5)+h)+s.charCodeAt(i))&0xFFFFFFFF;return h>>>0;}
 const ALL_SDK_NAMES=['canvas_commit','canvas_clear','canvas_set_font','canvas_set_color','canvas_draw_str','canvas_draw_str_aligned','canvas_draw_dot','canvas_draw_line','canvas_draw_frame','canvas_draw_box','canvas_draw_rbox','canvas_draw_rframe','canvas_draw_circle','canvas_draw_disc','canvas_draw_icon','canvas_draw_xbm','canvas_draw_bitmap','canvas_width','canvas_height','canvas_invert_color','canvas_get_font_params','view_port_alloc','view_port_free','view_port_enabled_set','view_port_draw_callback_set','view_port_input_callback_set','view_port_update','gui_add_view_port','gui_remove_view_port','gui_get_framebuffer_size','furi_delay_ms','furi_delay_tick','furi_thread_yield','furi_record_open','furi_record_close','malloc','free','calloc','realloc','furi_message_queue_alloc','furi_message_queue_put','furi_message_queue_get','furi_message_queue_free','furi_semaphore_alloc','furi_semaphore_acquire','furi_semaphore_release','furi_semaphore_free','furi_mutex_alloc','furi_mutex_acquire','furi_mutex_release','furi_mutex_free','furi_ms_to_ticks','__wrap_snprintf','__errno','furi_timer_alloc','furi_timer_free','furi_timer_start','furi_timer_stop','view_alloc','view_free','view_set_draw_callback','view_set_input_callback','view_dispatcher_alloc','view_dispatcher_free','view_dispatcher_enable_queue','view_dispatcher_attach_to_gui','view_dispatcher_run','view_dispatcher_stop','view_dispatcher_add_view','view_dispatcher_remove_view','view_dispatcher_switch_to_view','view_dispatcher_send_custom_event','view_dispatcher_set_event_callback_context','view_dispatcher_set_custom_event_callback','view_dispatcher_set_navigation_event_callback','view_dispatcher_set_tick_event_callback','infrared_send','infrared_get_protocol_address_length','infrared_get_protocol_command_length','infrared_get_protocol_name','infrared_alloc','infrared_free','infrared_signal_alloc','infrared_signal_free','furi_hal_infrared_async_tx_start','furi_hal_infrared_async_tx_stop','furi_hal_infrared_is_busy','furi_string_alloc','furi_string_free','notification_message','notification_message_block'];
@@ -705,7 +705,7 @@ function App(){
           else{uc_h.reg_write(RP.PC,((uc_h.reg_read(RP.PC)>>>0)+4)>>>0);}
         }
         else{uc_h.reg_write(RP.PC,(dst|1)>>>0);}  // resume in THUMB mode
-      },0xFFFF0000,0xFFFFFFFF);}catch(e){addLog(`[EXC] hook err: ${e?.message??String(e)}`);}
+      },0xFFFF0000,0xFFFFFFFE);}catch(e){addLog(`[EXC] hook err: ${e?.message??String(e)}`);}
       /* Demand-paging hook: map any unmapped region on access so startup writes don't crash */
       const MEM_INVALID=(window.uc.HOOK_MEM_READ_UNMAPPED??16)|(window.uc.HOOK_MEM_WRITE_UNMAPPED??32)|(window.uc.HOOK_MEM_FETCH_UNMAPPED??64);
       let dynMaps=0;
