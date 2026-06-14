@@ -658,6 +658,36 @@ function App(){
     try{
       const uc=new window.uc.Unicorn(window.uc.ARCH_ARM,window.uc.MODE_THUMB);
       ucRef.current=uc;
+      /* Register index self-test: write sentinels, read back immediately */
+      try{
+        const tests=[['SP(12)',12,0x20030000],['LR(10)',10,0xFEFEFEFE],['PC(11)',11,0x8000c0d],
+                      ['R0(66)',66,0x11111111],['R13(79)',79,0x20030001],['R14(80)',80,0xFEFEFEFD],['R15(81)',81,0x8000c01]];
+        const results=tests.map(([name,idx,val])=>{
+          let rb='ERR';
+          try{uc.reg_write(idx,val>>>0);const r=uc.reg_read(idx);rb=`0x${(r>>>0).toString(16)}`;}catch(e){rb=`ERR:${e?.message??String(e)}`;}
+          return `${name}=${rb}(wrote 0x${(val>>>0).toString(16)})`;
+        });
+        addLog(`[SELFTEST] ${results.join(' | ')}`);
+      }catch(e){addLog(`[SELFTEST] failed: ${e?.message??String(e)}`);}
+      /* MICROTEST: run 2x "MOVS R0,#0x42" + "BX LR" in isolation, check if execution actually mutates registers */
+      try{
+        uc.mem_map(0x00100000,0x1000,7);
+        uc.mem_write(0x00100000,new Uint8Array([0x42,0x20, 0x42,0x20, 0x70,0x47]));
+        uc.reg_write(10,0xFEFEFEFE>>>0); // LR(10) sentinel
+        uc.reg_write(66,0); // R0(66) = 0 before run
+        let mtErr='';
+        try{uc.emu_start((0x00100000|1)>>>0,0xFEFEFEFE>>>0,0,3);}catch(e){mtErr=` err:${e?.message??String(e)}`;}
+        const r0=(uc.reg_read(66)>>>0),pc11=(uc.reg_read(11)>>>0),pc81=(uc.reg_read(81)>>>0),lr10=(uc.reg_read(10)>>>0);
+        addLog(`[MICROTEST] R0=0x${r0.toString(16)} PC(11)=0x${pc11.toString(16)} PC(81)=0x${pc81.toString(16)} LR(10)=0x${lr10.toString(16)}${mtErr}`);
+      }catch(e){addLog(`[MICROTEST] setup failed: ${e?.message??String(e)}`);}
+      /* API surface dump as last-resort fallback */
+      try{
+        const proto=Object.getPrototypeOf(uc);
+        const methods=Object.getOwnPropertyNames(proto).filter(n=>typeof uc[n]==='function').join(', ');
+        const ownProps=Object.keys(uc).join(', ');
+        addLog(`[API] proto methods: ${methods}`);
+        addLog(`[API] own props: ${ownProps||'(none)'}`);
+      }catch(e){addLog(`[API] dump failed: ${e?.message??String(e)}`);}
       pendingDrawRef.current=false;waitingInputRef.current=false;
       const{stubs,handlers}=buildStubs(displayRef.current,inputQueue,addLog,{
         onDraw:()=>{pendingDrawRef.current=true;},
@@ -672,7 +702,8 @@ function App(){
       let intrCount=0;try{uc.hook_add(window.uc.HOOK_INTR,(uc_h,intno)=>{if(intrCount++<5)addLog(`[INT] interrupt #${intno} (total: ${intrCount})`);});}catch(e){}
       /* EXC_RETURN hook — simulate Cortex-M exception return by popping the hardware frame */
       let excHookCount=0;
-      try{uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
+      const EXC_HOOK_ENABLED=false; /* disabled pending register-index diagnosis */
+      try{if(!EXC_HOOK_ENABLED)throw new Error('disabled');uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
         excHookCount++;
         /* Read 4 bytes from emulated memory */
         const r32=(a)=>{try{const d=uc_h.mem_read(a>>>0,4);if(d&&d.length>=4)return new DataView(d.buffer,d.byteOffset).getUint32(0,true);}catch(e){}return 0;};
@@ -706,7 +737,7 @@ function App(){
           else{uc_h.reg_write(RP.PC,((uc_h.reg_read(RP.PC)>>>0)+4)>>>0);}
         }
         else{uc_h.reg_write(RP.PC,(dst|1)>>>0);}  // resume in THUMB mode
-      },0xFFFF0000,0xFFFFFFFE);}catch(e){addLog(`[EXC] hook err: ${e?.message??String(e)}`);}
+      },0xFFFF0000,0xFFFFFFFE);}catch(e){if(e?.message!=='disabled')addLog(`[EXC] hook err: ${e?.message??String(e)}`);else addLog('[EXC] hook disabled for this run');}
       /* Demand-paging hook: map any unmapped region on access so startup writes don't crash */
       const MEM_INVALID=(window.uc.HOOK_MEM_READ_UNMAPPED??16)|(window.uc.HOOK_MEM_WRITE_UNMAPPED??32)|(window.uc.HOOK_MEM_FETCH_UNMAPPED??64);
       let dynMaps=0;
