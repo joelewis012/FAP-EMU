@@ -153,8 +153,8 @@ function buildStubs(display,inputQueueRef,logFn,cb={}){const{onDraw,onWaitInput}
   const log=logFn||(()=>{});
   function reg(name,fn){stubs[name]=nextAddr;handlers[nextAddr]=fn;nextAddr+=4;}
   const d=display;let heap=HEAP_BASE;
-  const rr=(uc,n)=>(uc.reg_read(RP.R0+n))>>>0;
-  const spa=(uc,n)=>{const s=(uc.reg_read(RP.SP))>>>0;const b=uc.mem_read(s+n*4,4);return(b[0]|(b[1]<<8)|(b[2]<<16)|(b[3]<<24))>>>0;};
+  const rr=(uc,n)=>(uc.reg_read_i32(RP.R0+n))>>>0;
+  const spa=(uc,n)=>{const s=(uc.reg_read_i32(RP.SP))>>>0;const b=uc.mem_read(s+n*4,4);return(b[0]|(b[1]<<8)|(b[2]<<16)|(b[3]<<24))>>>0;};
   const rs=(uc,addr)=>{if(!addr)return'';let s='';try{for(let i=0;i<256;i++){const b=uc.mem_read(addr+i,1)[0];if(!b)break;s+=String.fromCharCode(b);}}catch(e){}return s;};
   const mm=(uc,sz)=>{if(!sz)return 0;const a=heap;heap+=(sz+7)&~7;try{if(uc)uc.mem_write(a,new Uint8Array(sz));}catch(e){}return a;};
   const w32=(uc,addr,val)=>{const b=new Uint8Array(4);new DataView(b.buffer).setUint32(0,val,true);try{uc.mem_write(addr,b);}catch(e){}};
@@ -459,7 +459,7 @@ function loadFAP(uc,fap,stubs,log){
     }
     log(`[FAST] ${fsec.name}: resolved ${resolved} SDK call-site groups`);
   }
-  uc.reg_write(RP.SP,STACK_TOP);uc.reg_write(RP.LR,0xFEFEFEFE);
+  uc.reg_write_i32(RP.SP,STACK_TOP);uc.reg_write_i32(RP.LR,0xFEFEFEFE);
   const entry=hasPhdrs?(fap.eEntry|1):((fap.eEntry+delta)|1);log(`[EMU] Entry: 0x${entry.toString(16)}`);return{entry,callSites};
 }
 
@@ -664,30 +664,22 @@ function App(){
                       ['R0(66)',66,0x11111111],['R13(79)',79,0x20030001],['R14(80)',80,0xFEFEFEFD],['R15(81)',81,0x8000c01]];
         const results=tests.map(([name,idx,val])=>{
           let rb='ERR';
-          try{uc.reg_write(idx,val>>>0);const r=uc.reg_read(idx);rb=`0x${(r>>>0).toString(16)}`;}catch(e){rb=`ERR:${e?.message??String(e)}`;}
+          try{uc.reg_write_i32(idx,val>>>0);const r=uc.reg_read_i32(idx);rb=`0x${(r>>>0).toString(16)}`;}catch(e){rb=`ERR:${e?.message??String(e)}`;}
           return `${name}=${rb}(wrote 0x${(val>>>0).toString(16)})`;
         });
         addLog(`[SELFTEST] ${results.join(' | ')}`);
       }catch(e){addLog(`[SELFTEST] failed: ${e?.message??String(e)}`);}
-      /* MICROTEST: run 2x "MOVS R0,#0x42" + "BX LR" in isolation, check if execution actually mutates registers */
+      /* MICROTEST: run 2x "MOVS R0,#0x42" + "BX LR" in isolation, jumping back into mapped region to avoid unmapped-fetch */
       try{
         uc.mem_map(0x00100000,0x1000,7);
         uc.mem_write(0x00100000,new Uint8Array([0x42,0x20, 0x42,0x20, 0x70,0x47]));
-        uc.reg_write(10,0xFEFEFEFE>>>0); // LR(10) sentinel
-        uc.reg_write(66,0); // R0(66) = 0 before run
+        uc.reg_write_i32(10,(0x00100000|1)>>>0); // LR(10) -> back into our own mapped region
+        uc.reg_write_i32(66,0); // R0(66) = 0 before run
         let mtErr='';
         try{uc.emu_start((0x00100000|1)>>>0,0xFEFEFEFE>>>0,0,3);}catch(e){mtErr=` err:${e?.message??String(e)}`;}
-        const r0=(uc.reg_read(66)>>>0),pc11=(uc.reg_read(11)>>>0),pc81=(uc.reg_read(81)>>>0),lr10=(uc.reg_read(10)>>>0);
+        const r0=(uc.reg_read_i32(66)>>>0),pc11=(uc.reg_read_i32(11)>>>0),pc81=(uc.reg_read_i32(81)>>>0),lr10=(uc.reg_read_i32(10)>>>0);
         addLog(`[MICROTEST] R0=0x${r0.toString(16)} PC(11)=0x${pc11.toString(16)} PC(81)=0x${pc81.toString(16)} LR(10)=0x${lr10.toString(16)}${mtErr}`);
       }catch(e){addLog(`[MICROTEST] setup failed: ${e?.message??String(e)}`);}
-      /* API surface dump as last-resort fallback */
-      try{
-        const proto=Object.getPrototypeOf(uc);
-        const methods=Object.getOwnPropertyNames(proto).filter(n=>typeof uc[n]==='function').join(', ');
-        const ownProps=Object.keys(uc).join(', ');
-        addLog(`[API] proto methods: ${methods}`);
-        addLog(`[API] own props: ${ownProps||'(none)'}`);
-      }catch(e){addLog(`[API] dump failed: ${e?.message??String(e)}`);}
       pendingDrawRef.current=false;waitingInputRef.current=false;
       const{stubs,handlers}=buildStubs(displayRef.current,inputQueue,addLog,{
         onDraw:()=>{pendingDrawRef.current=true;},
@@ -695,27 +687,27 @@ function App(){
       });
       uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
         const h=handlers[addr];
-        if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e?.message??String(e)}`);ret=0;}if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);const lr=uc_h.reg_read(RP.LR)>>>0;uc_h.reg_write(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
-        if((uc_h.reg_read(RP.PC)>>>0)===0xFEFEFEFE)uc_h.emu_stop();
+        if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e?.message??String(e)}`);ret=0;}if(ret!==undefined)uc_h.reg_write_i32(RP.R0,ret>>>0);const lr=uc_h.reg_read_i32(RP.LR)>>>0;uc_h.reg_write_i32(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
+        if((uc_h.reg_read_i32(RP.PC)>>>0)===0xFEFEFEFE)uc_h.emu_stop();
       },STUB_BASE,STUB_BASE+0x100000);
       /* HOOK_INTR — log software interrupts (SVC etc) */
       let intrCount=0;try{uc.hook_add(window.uc.HOOK_INTR,(uc_h,intno)=>{if(intrCount++<5)addLog(`[INT] interrupt #${intno} (total: ${intrCount})`);});}catch(e){}
       /* EXC_RETURN hook — simulate Cortex-M exception return by popping the hardware frame */
       let excHookCount=0;
-      const EXC_HOOK_ENABLED=false; /* disabled pending register-index diagnosis */
+      const EXC_HOOK_ENABLED=true; /* re-enabled now that reg_write_i32/reg_read_i32 are correct */
       try{if(!EXC_HOOK_ENABLED)throw new Error('disabled');uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
         excHookCount++;
         /* Read 4 bytes from emulated memory */
         const r32=(a)=>{try{const d=uc_h.mem_read(a>>>0,4);if(d&&d.length>=4)return new DataView(d.buffer,d.byteOffset).getUint32(0,true);}catch(e){}return 0;};
-        const hookPC=(uc_h.reg_read(RP.PC)>>>0);
-        const sp=(uc_h.reg_read(RP.SP)>>>0);
+        const hookPC=(uc_h.reg_read_i32(RP.PC)>>>0);
+        const sp=(uc_h.reg_read_i32(RP.SP)>>>0);
         /* Cortex-M exception frame: R0,R1,R2,R3,R12,LR,PC,xPSR at SP..SP+31 */
         const retR0=r32(sp),retR1=r32(sp+4),retR2=r32(sp+8),retR3=r32(sp+12);
         const retR12=r32(sp+16),retLR=r32(sp+20),retPC=r32(sp+24);
-        uc_h.reg_write(RP.SP,(sp+32)>>>0);
-        uc_h.reg_write(RP.R0,retR0>>>0);uc_h.reg_write(RP.R1,retR1>>>0);
-        uc_h.reg_write(RP.R2,retR2>>>0);uc_h.reg_write(RP.R3,retR3>>>0);
-        uc_h.reg_write(RP.LR,retLR>>>0);
+        uc_h.reg_write_i32(RP.SP,(sp+32)>>>0);
+        uc_h.reg_write_i32(RP.R0,retR0>>>0);uc_h.reg_write_i32(RP.R1,retR1>>>0);
+        uc_h.reg_write_i32(RP.R2,retR2>>>0);uc_h.reg_write_i32(RP.R3,retR3>>>0);
+        uc_h.reg_write_i32(RP.LR,retLR>>>0);
         const dst=(retPC>>>0);
         if(excHookCount<=5)addLog(`[EXC] #${excHookCount} hookPC=0x${hookPC.toString(16)} sp=0x${sp.toString(16)} dst=0x${dst.toString(16)} lr=0x${retLR.toString(16)}`);
         if(excHookCount===200)addLog('[EXC] suppressing further [EXC] logs (200 reached)');
@@ -732,11 +724,11 @@ function App(){
           setEmuState('idle');
         } else if(dst===0){
           /* Frame pop gave PC=0 — fall back to LR register */
-          const fb=(uc_h.reg_read(RP.LR)>>>0)&~1;
-          if(fb&&fb!==0xFEFEFEFE){uc_h.reg_write(RP.PC,(fb|1)>>>0);}
-          else{uc_h.reg_write(RP.PC,((uc_h.reg_read(RP.PC)>>>0)+4)>>>0);}
+          const fb=(uc_h.reg_read_i32(RP.LR)>>>0)&~1;
+          if(fb&&fb!==0xFEFEFEFE){uc_h.reg_write_i32(RP.PC,(fb|1)>>>0);}
+          else{uc_h.reg_write_i32(RP.PC,((uc_h.reg_read_i32(RP.PC)>>>0)+4)>>>0);}
         }
-        else{uc_h.reg_write(RP.PC,(dst|1)>>>0);}  // resume in THUMB mode
+        else{uc_h.reg_write_i32(RP.PC,(dst|1)>>>0);}  // resume in THUMB mode
       },0xFFFF0000,0xFFFFFFFE);}catch(e){if(e?.message!=='disabled')addLog(`[EXC] hook err: ${e?.message??String(e)}`);else addLog('[EXC] hook disabled for this run');}
       /* Demand-paging hook: map any unmapped region on access so startup writes don't crash */
       const MEM_INVALID=(window.uc.HOOK_MEM_READ_UNMAPPED??16)|(window.uc.HOOK_MEM_WRITE_UNMAPPED??32)|(window.uc.HOOK_MEM_FETCH_UNMAPPED??64);
@@ -755,7 +747,7 @@ function App(){
       let slotReadCount=0;
       try{uc.hook_add((window.uc.HOOK_MEM_READ??1024),(uc_h,_t,addr)=>{
         const a=addr>>>0;
-        if(slotReadCount<10){slotReadCount++;const pc=(uc_h.reg_read(RP.PC)>>>0);addLog(`[SRD] slot read 0x${a.toString(16)} from PC=0x${pc.toString(16)}`);}
+        if(slotReadCount<10){slotReadCount++;const pc=(uc_h.reg_read_i32(RP.PC)>>>0);addLog(`[SRD] slot read 0x${a.toString(16)} from PC=0x${pc.toString(16)}`);}
       },0x8000900,0x8000e00);}catch(e){addLog(`[SRD] hook err: ${e?.message??String(e)}`);}
       /* Static binary: hook known SDK functions at their actual addresses */
       const staticFns=fap.definedFns||{};
@@ -769,16 +761,16 @@ function App(){
           if(!handler)continue;
           uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
             let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
-            if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
+            if(ret!==undefined)uc_h.reg_write_i32(RP.R0,ret>>>0);
             if(name==='canvas_commit'){commitSeen=true;renderDisplay();}
-            const lr=(uc_h.reg_read(RP.LR)>>>0)&~1;
-            uc_h.reg_write(RP.PC,lr?lr:0xFEFEFEFE);
+            const lr=(uc_h.reg_read_i32(RP.LR)>>>0)&~1;
+            uc_h.reg_write_i32(RP.PC,lr?lr:0xFEFEFEFE);
           },addr,addr);
         }
       }
       const{entry,callSites}=loadFAP(uc,fap,stubs,addLog);
       try{
-        const preSP=(uc.reg_read(RP.SP)>>>0),prePC=(uc.reg_read(RP.PC)>>>0),preLR=(uc.reg_read(RP.LR)>>>0);
+        const preSP=(uc.reg_read_i32(RP.SP)>>>0),prePC=(uc.reg_read_i32(RP.PC)>>>0),preLR=(uc.reg_read_i32(RP.LR)>>>0);
         addLog(`[EMU] pre-run regs — SP=0x${preSP.toString(16)} PC=0x${prePC.toString(16)} LR=0x${preLR.toString(16)} entry=0x${entry.toString(16)}`);
       }catch(e){addLog(`[EMU] pre-run reg read err: ${e?.message??String(e)}`);}
       let callSiteHits=0;const callSiteFirstHits=[];
@@ -791,9 +783,9 @@ function App(){
             callSiteHits++;
             if(callSiteFirstHits.length<10)callSiteFirstHits.push(`${symName}@0x${addr.toString(16)}`);
             let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
-            if(ret!==undefined)uc_h.reg_write(RP.R0,ret>>>0);
+            if(ret!==undefined)uc_h.reg_write_i32(RP.R0,ret>>>0);
             if(symName==='canvas_commit'){commitSeen=true;renderDisplay();}
-            uc_h.reg_write(RP.PC,((uc_h.reg_read(RP.PC)>>>0)+4)>>>0); /* skip BL/BLX */
+            uc_h.reg_write_i32(RP.PC,((uc_h.reg_read_i32(RP.PC)>>>0)+4)>>>0); /* skip BL/BLX */
           },addr,addr);
         }
       }
@@ -801,16 +793,16 @@ function App(){
       const triggerDraw=()=>{
         const cb=stubs._getVPDraw?.(),ctx=stubs._getVPCtx?.();
         if(!cb){return;}
-        const saved=[RP.R0,RP.R1,RP.R2,RP.R3,RP.LR,RP.PC,RP.SP].map(r=>[r,uc.reg_read(r)>>>0]);
-        uc.reg_write(RP.R0,CANVAS_FAKE);uc.reg_write(RP.R1,(ctx||0)>>>0);uc.reg_write(RP.LR,0xFEFEFEFE);
+        const saved=[RP.R0,RP.R1,RP.R2,RP.R3,RP.LR,RP.PC,RP.SP].map(r=>[r,uc.reg_read_i32(r)>>>0]);
+        uc.reg_write_i32(RP.R0,CANVAS_FAKE);uc.reg_write_i32(RP.R1,(ctx||0)>>>0);uc.reg_write_i32(RP.LR,0xFEFEFEFE);
         addLog(`[DRAW] calling draw_cb @ 0x${cb.toString(16)}`);
         try{uc.emu_start((cb|1)>>>0,0xFEFEFEFE,0,1000000);commitSeen=true;renderDisplay();}catch(e){addLog(`[DRAW] err: ${e?.message??String(e)}`);}
-        saved.forEach(([r,v])=>{try{uc.reg_write(r,v);}catch(e){}});
+        saved.forEach(([r,v])=>{try{uc.reg_write_i32(r,v);}catch(e){}});
       };
       addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
       try{uc.emu_start(entry,0xFEFEFEFE,0,50000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
       try{
-        const finalPC=(uc.reg_read(RP.PC)>>>0),finalSP=(uc.reg_read(RP.SP)>>>0);
+        const finalPC=(uc.reg_read_i32(RP.PC)>>>0),finalSP=(uc.reg_read_i32(RP.SP)>>>0);
         addLog(`[EMU] init done — PC=0x${finalPC.toString(16)} SP=0x${finalSP.toString(16)} excHooks=${excHookCount} callSiteHits=${callSiteHits} [${callSiteFirstHits.join(', ')}] commitSeen=${commitSeen} pendingDraw=${pendingDrawRef.current}`);
       }catch(e){}
       renderDisplay();
@@ -818,10 +810,10 @@ function App(){
         if(emuStateRef.current!=='running'){loopRef.current=null;return;}
         if(pendingDrawRef.current){pendingDrawRef.current=false;triggerDraw();}
         if(!waitingInputRef.current){
-          try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,100000);renderDisplay();}catch(e){if(emuStateRef.current==='running')addLog(`[ERR] tick: ${e?.message??String(e)}`);}
+          try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,100000);renderDisplay();}catch(e){if(emuStateRef.current==='running')addLog(`[ERR] tick: ${e?.message??String(e)}`);}
         }else if(inputQueue.current.length>0){
           waitingInputRef.current=false;
-          try{const pc=uc.reg_read(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,100000);renderDisplay();}catch(e){}
+          try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,100000);renderDisplay();}catch(e){}
         }
         loopRef.current=requestAnimationFrame(tick);
       };
