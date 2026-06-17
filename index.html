@@ -660,26 +660,24 @@ function App(){
       ucRef.current=uc;
       /* Register index self-test: write sentinels, read back immediately */
       try{
-        const tests=[['SP(12)',12,0x20030000],['LR(10)',10,0xFEFEFEFE],['PC(11)',11,0x8000c0d],
-                      ['R0(66)',66,0x11111111],['R13(79)',79,0x20030001],['R14(80)',80,0xFEFEFEFD],['R15(81)',81,0x8000c01]];
-        const results=tests.map(([name,idx,val])=>{
-          let rb='ERR';
-          try{uc.reg_write_i32(idx,val>>>0);const r=uc.reg_read_i32(idx);rb=`0x${(r>>>0).toString(16)}`;}catch(e){rb=`ERR:${e?.message??String(e)}`;}
-          return `${name}=${rb}(wrote 0x${(val>>>0).toString(16)})`;
-        });
-        addLog(`[SELFTEST] ${results.join(' | ')}`);
+        /* Try different parameter orders and signatures for reg_write_i32 */
+        const sig_results=[];
+        const SENTINEL=0xCAFEBABE;
+        /* Pattern A: reg_write_i32(regid, value) */
+        try{uc.reg_write_i32(66,SENTINEL>>>0);const r=uc.reg_read_i32(66)>>>0;sig_results.push(`A(regid,val):R0=0x${r.toString(16)}`);}catch(e){sig_results.push(`A:ERR`);}
+        /* Pattern B: reg_write_i32(value, regid) — swapped */
+        try{uc.reg_write_i32(SENTINEL>>>0,66);const r=uc.reg_read_i32(66)>>>0;sig_results.push(`B(val,regid):R0=0x${r.toString(16)}`);}catch(e){sig_results.push(`B:ERR`);}
+        /* Pattern C: reg_write(regid, value) — the untyped version */
+        try{uc.reg_write(66,SENTINEL>>>0);const r=uc.reg_read(66)>>>0;sig_results.push(`C(reg_write):R0=0x${r.toString(16)}`);}catch(e){sig_results.push(`C:ERR`);}
+        /* Pattern D: reg_write_type(type, regid, value) */
+        try{uc.reg_write_type('i32',66,SENTINEL>>>0);const r=uc.reg_read_type('i32',66)>>>0;sig_results.push(`D(type,regid,val):R0=0x${r.toString(16)}`);}catch(e){sig_results.push(`D:ERR ${e?.message}`);}
+        /* Pattern E: reg_read_i32 return type check */
+        try{uc.reg_write_i32(66,0x42424242);const r=uc.reg_read_i32(66);sig_results.push(`E_type:${typeof r}=${JSON.stringify(r)}`);}catch(e){sig_results.push(`E:ERR`);}
+        addLog(`[SELFTEST] ${sig_results.join(' | ')}`);
+        /* Also check what reg_write_i32.length (num expected args) is */
+        try{addLog(`[SELFTEST2] reg_write_i32.length=${uc.reg_write_i32.length} reg_read_i32.length=${uc.reg_read_i32.length} reg_write.length=${uc.reg_write.length}`);}catch(e){}
       }catch(e){addLog(`[SELFTEST] failed: ${e?.message??String(e)}`);}
-      /* MICROTEST: run 2x "MOVS R0,#0x42" + "BX LR" in isolation, jumping back into mapped region to avoid unmapped-fetch */
-      try{
-        uc.mem_map(0x00100000,0x1000,7);
-        uc.mem_write(0x00100000,new Uint8Array([0x42,0x20, 0x42,0x20, 0x70,0x47]));
-        uc.reg_write_i32(10,(0x00100000|1)>>>0); // LR(10) -> back into our own mapped region
-        uc.reg_write_i32(66,0); // R0(66) = 0 before run
-        let mtErr='';
-        try{uc.emu_start((0x00100000|1)>>>0,0xFEFEFEFE>>>0,0,3);}catch(e){mtErr=` err:${e?.message??String(e)}`;}
-        const r0=(uc.reg_read_i32(66)>>>0),pc11=(uc.reg_read_i32(11)>>>0),pc81=(uc.reg_read_i32(81)>>>0),lr10=(uc.reg_read_i32(10)>>>0);
-        addLog(`[MICROTEST] R0=0x${r0.toString(16)} PC(11)=0x${pc11.toString(16)} PC(81)=0x${pc81.toString(16)} LR(10)=0x${lr10.toString(16)}${mtErr}`);
-      }catch(e){addLog(`[MICROTEST] setup failed: ${e?.message??String(e)}`);}
+      /* MICROTEST: removed to avoid interfering with main memory map */
       pendingDrawRef.current=false;waitingInputRef.current=false;
       const{stubs,handlers}=buildStubs(displayRef.current,inputQueue,addLog,{
         onDraw:()=>{pendingDrawRef.current=true;},
@@ -810,7 +808,12 @@ function App(){
         if(emuStateRef.current!=='running'){loopRef.current=null;return;}
         if(pendingDrawRef.current){pendingDrawRef.current=false;triggerDraw();}
         if(!waitingInputRef.current){
-          try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,100000);renderDisplay();}catch(e){if(emuStateRef.current==='running')addLog(`[ERR] tick: ${e?.message??String(e)}`);}
+          try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,100000);renderDisplay();}catch(e){
+          addLog(`[ERR] tick: ${e?.message??String(e)}`);
+          setEmuState('idle');emuStateRef.current='idle';
+          if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}
+          loopRef.current=null;return;
+        }
         }else if(inputQueue.current.length>0){
           waitingInputRef.current=false;
           try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,100000);renderDisplay();}catch(e){}
