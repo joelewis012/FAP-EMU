@@ -697,8 +697,6 @@ function App(){
     try{
       const uc=new window.uc.Unicorn(window.uc.ARCH_ARM,window.uc.MODE_THUMB);
       ucRef.current=uc;
-      /* Register index self-test: write sentinels, read back immediately */
-      try{
       uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
         const h=handlers[addr];
         if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e?.message??String(e)}`);ret=0;}if(ret!==undefined)uc_h.reg_write_i32(RP.R0,ret>>>0);const lr=uc_h.reg_read_i32(RP.LR)>>>0;uc_h.reg_write_i32(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
