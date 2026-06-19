@@ -363,7 +363,46 @@ function buildStubs(display,inputQueueRef,logFn,cb={}){const{onDraw,onWaitInput}
   reg('storage_file_exists',()=>0); reg('storage_common_mkdir',()=>0);
   reg('storage_common_stat',()=>1); reg('storage_common_remove',()=>0);
 
-  stubs._regUnknown=(name)=>{if(stubs[name]!==undefined)return;reg(name,()=>{log(`[STUB] unhandled: ${name}`);return 0;});};
+  /* ARM AEABI double-precision helpers (soft-float calling convention)
+     doubles passed as R0:R1 (a) and R2:R3 (b), result in R0:R1 */
+  {
+    const rdbl=(uc,r1,r2)=>{const b=new ArrayBuffer(8),dv=new DataView(b);dv.setUint32(0,uc.reg_read_i32(r1)>>>0,true);dv.setUint32(4,uc.reg_read_i32(r2)>>>0,true);return dv.getFloat64(0,true);};
+    const wdbl=(uc,r1,r2,v)=>{const b=new ArrayBuffer(8),dv=new DataView(b);dv.setFloat64(0,v,true);uc.reg_write_i32(r1,dv.getUint32(0,true)>>>0);uc.reg_write_i32(r2,dv.getUint32(4,true)>>>0);};
+    const ra=(uc)=>rdbl(uc,RP.R0,RP.R1),rb=(uc)=>rdbl(uc,RP.R2,RP.R3);
+    const wa=(uc,v)=>wdbl(uc,RP.R0,RP.R1,v);
+    reg('__aeabi_dadd',(uc)=>{wa(uc,ra(uc)+rb(uc));});
+    reg('__aeabi_dsub',(uc)=>{wa(uc,ra(uc)-rb(uc));});
+    reg('__aeabi_dmul',(uc)=>{wa(uc,ra(uc)*rb(uc));});
+    reg('__aeabi_ddiv',(uc)=>{wa(uc,ra(uc)/rb(uc));});
+    reg('__aeabi_dcmplt',(uc)=>ra(uc)<rb(uc)?1:0);
+    reg('__aeabi_dcmpgt',(uc)=>ra(uc)>rb(uc)?1:0);
+    reg('__aeabi_dcmpeq',(uc)=>ra(uc)===rb(uc)?1:0);
+    reg('__aeabi_dcmple',(uc)=>ra(uc)<=rb(uc)?1:0);
+    reg('__aeabi_dcmpge',(uc)=>ra(uc)>=rb(uc)?1:0);
+    reg('__aeabi_dcmpun',(uc)=>(isNaN(ra(uc))||isNaN(rb(uc)))?1:0);
+    reg('__cmpdf2',   (uc)=>{const a=ra(uc),b=rb(uc);return(isNaN(a)||isNaN(b))?1:a<b?-1:a>b?1:0;});
+    /* Conforming compare: also set CPSR flags so BLE/BLS/BGT branches work */
+    const setCPSR=(uc,le)=>{try{const cpsr=uc.reg_read_i32(3)>>>0;uc.reg_write_i32(3,(cpsr&0x0FFFFFFF)|(le?0x40000000:0x20000000));}catch(e){}};
+    reg('__aeabi_cdcmple', (uc)=>{setCPSR(uc,ra(uc)<=rb(uc));});
+    reg('__aeabi_cdrcmple',(uc)=>{setCPSR(uc,rb(uc)<=ra(uc));});
+    reg('__aeabi_i2d', (uc)=>{wa(uc,(rr(uc,0)|0));});
+    reg('__aeabi_d2i', (uc)=>Math.trunc(ra(uc))|0);
+    reg('__aeabi_ui2d',(uc)=>{wa(uc,rr(uc,0)>>>0);});
+    reg('__ieee754_pow',(uc)=>{wa(uc,Math.pow(ra(uc),rb(uc)));});
+    reg('fabs',  (uc)=>{wa(uc,Math.abs(ra(uc)));});
+    reg('finite',(uc)=>isFinite(ra(uc))?1:0);
+    reg('scalbn',(uc)=>{wa(uc,ra(uc)*Math.pow(2,rr(uc,2)|0));});
+    const ERRNO_ADDR=0x20000008;
+    reg('__errno',()=>ERRNO_ADDR);
+  }
+
+  const _stubHitCount={};
+  stubs._regUnknown=(name)=>{if(stubs[name]!==undefined)return;reg(name,()=>{
+    _stubHitCount[name]=(_stubHitCount[name]||0)+1;
+    if(_stubHitCount[name]<=3)log(`[STUB] unhandled: ${name} (hit ${_stubHitCount[name]})`);
+    if(_stubHitCount[name]===4)log(`[STUB] suppressing further '${name}' messages`);
+    return 0;
+  });};
   stubs._nextAddr=()=>nextAddr;
   return{stubs,handlers};
 }
@@ -660,29 +699,6 @@ function App(){
       ucRef.current=uc;
       /* Register index self-test: write sentinels, read back immediately */
       try{
-        /* Try different parameter orders and signatures for reg_write_i32 */
-        const sig_results=[];
-        const SENTINEL=0xCAFEBABE;
-        /* Pattern A: reg_write_i32(regid, value) */
-        try{uc.reg_write_i32(66,SENTINEL>>>0);const r=uc.reg_read_i32(66)>>>0;sig_results.push(`A(regid,val):R0=0x${r.toString(16)}`);}catch(e){sig_results.push(`A:ERR`);}
-        /* Pattern B: reg_write_i32(value, regid) — swapped */
-        try{uc.reg_write_i32(SENTINEL>>>0,66);const r=uc.reg_read_i32(66)>>>0;sig_results.push(`B(val,regid):R0=0x${r.toString(16)}`);}catch(e){sig_results.push(`B:ERR`);}
-        /* Pattern C: reg_write(regid, value) — the untyped version */
-        try{uc.reg_write(66,SENTINEL>>>0);const r=uc.reg_read(66)>>>0;sig_results.push(`C(reg_write):R0=0x${r.toString(16)}`);}catch(e){sig_results.push(`C:ERR`);}
-        /* Pattern D: reg_write_type(type, regid, value) */
-        try{uc.reg_write_type('i32',66,SENTINEL>>>0);const r=uc.reg_read_type('i32',66)>>>0;sig_results.push(`D(type,regid,val):R0=0x${r.toString(16)}`);}catch(e){sig_results.push(`D:ERR ${e?.message}`);}
-        /* Pattern E: reg_read_i32 return type check */
-        try{uc.reg_write_i32(66,0x42424242);const r=uc.reg_read_i32(66);sig_results.push(`E_type:${typeof r}=${JSON.stringify(r)}`);}catch(e){sig_results.push(`E:ERR`);}
-        addLog(`[SELFTEST] ${sig_results.join(' | ')}`);
-        /* Also check what reg_write_i32.length (num expected args) is */
-        try{addLog(`[SELFTEST2] reg_write_i32.length=${uc.reg_write_i32.length} reg_read_i32.length=${uc.reg_read_i32.length} reg_write.length=${uc.reg_write.length}`);}catch(e){}
-      }catch(e){addLog(`[SELFTEST] failed: ${e?.message??String(e)}`);}
-      /* MICROTEST: removed to avoid interfering with main memory map */
-      pendingDrawRef.current=false;waitingInputRef.current=false;
-      const{stubs,handlers}=buildStubs(displayRef.current,inputQueue,addLog,{
-        onDraw:()=>{pendingDrawRef.current=true;},
-        onWaitInput:(uc_h)=>{waitingInputRef.current=true;pendingDrawRef.current=true;uc_h.emu_stop();}
-      });
       uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
         const h=handlers[addr];
         if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e?.message??String(e)}`);ret=0;}if(ret!==undefined)uc_h.reg_write_i32(RP.R0,ret>>>0);const lr=uc_h.reg_read_i32(RP.LR)>>>0;uc_h.reg_write_i32(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
@@ -922,6 +938,8 @@ function App(){
       {zoomed&&<ZoomModal canvasRef={canvasRef} onClose={()=>setZoomed(false)}/>}
     </div>
   );
+}
+
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
