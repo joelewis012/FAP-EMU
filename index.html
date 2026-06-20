@@ -694,6 +694,11 @@ function App(){
       watchdogRef.current=null;
     },30000);
     const watchdog=watchdogRef.current;
+    pendingDrawRef.current=false;waitingInputRef.current=false;
+    const{stubs,handlers}=buildStubs(displayRef.current,inputQueue,addLog,{
+      onDraw:()=>{pendingDrawRef.current=true;},
+      onWaitInput:(uc_h)=>{waitingInputRef.current=true;pendingDrawRef.current=true;uc_h.emu_stop();}
+    });
     try{
       const uc=new window.uc.Unicorn(window.uc.ARCH_ARM,window.uc.MODE_THUMB);
       ucRef.current=uc;
@@ -776,7 +781,8 @@ function App(){
         saved.forEach(([r,v])=>{try{uc.reg_write_i32(r,v);}catch(e){}});
       };
       addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
-      try{uc.emu_start(entry,0xFEFEFEFE,0,50000000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
+      /* Run until app blocks on input (emu_stop) or returns — no instruction limit */
+      try{uc.emu_start(entry,0xFEFEFEFE,0,0);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
       try{
         const finalPC=(uc.reg_read_i32(RP.PC)>>>0),finalSP=(uc.reg_read_i32(RP.SP)>>>0);
         addLog(`[EMU] init done — PC=0x${finalPC.toString(16)} SP=0x${finalSP.toString(16)} callSiteHits=${callSiteHits} [${callSiteFirstHits.join(', ')}] commitSeen=${commitSeen} pendingDraw=${pendingDrawRef.current}`);
@@ -794,7 +800,7 @@ function App(){
             if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}
             loopRef.current=null;return;
           }
-          uc.emu_start(pc|1,0xFEFEFEFE,0,100000);
+          uc.emu_start(pc|1,0xFEFEFEFE,0,200000);
           /* Check if app returned after emu_start */
           const pcAfter=uc.reg_read_i32(RP.PC)>>>0;
           if(pcAfter===0xFEFEFEFE){addLog('[EMU] App returned normally');setEmuState('idle');emuStateRef.current='idle';loopRef.current=null;return;}
@@ -807,7 +813,7 @@ function App(){
         }
         }else if(inputQueue.current.length>0){
           waitingInputRef.current=false;
-          try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,100000);renderDisplay();}catch(e){}
+          try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,200000);renderDisplay();}catch(e){}
         }
         loopRef.current=requestAnimationFrame(tick);
       };
