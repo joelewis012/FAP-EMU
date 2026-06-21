@@ -657,9 +657,12 @@ function App(){
     return()=>{window.removeEventListener('keydown',dn);window.removeEventListener('keyup',up);};
   },[]);
 
+  /* Keep a stable ref to stopFAP so handleFile's useCallback never holds a stale copy */
+  const stopFAPRef=useRef(null);
+
   const handleFile=useCallback(file=>{
     if(!file)return;
-    if(emuStateRef.current==='running')stopFAP();
+    if(emuStateRef.current==='running')stopFAPRef.current?.();
     setError(null);setFap(null);setEmuState('idle');emuStateRef.current='idle';setLogs([]);
     displayRef.current.clear();renderDisplay();
     const reader=new FileReader();
@@ -669,28 +672,22 @@ function App(){
       const diag=[];
       diag.push(`[ELF] type=${r.isDyn?'ET_DYN':'ET_EXEC'} entry=0x${r.eEntry.toString(16)} sections=${r.rawSections.length} phdrs=${r.phdrs?.length??0}`);
       diag.push(`[ELF] ${r.imports.length} imports, ${Object.keys(r.definedFns||{}).length} defined SDK fns matched`);
-      /* Scan .fast.rel.text (and similarly-named sections) for djb2 hash matches at every byte offset */
-      const u8all=new Uint8Array(r.buffer);
+      /* Summarise .fast.rel.text hash matches without hex-dumping the section.
+         The previous code dumped every 32 bytes as a separate log entry then called
+         setLogs() with the full array. React rendered all entries as un-virtualised
+         divs in one synchronous paint, blocking the JS thread and freezing the UI. */
       const dv=new DataView(r.buffer);
       r.rawSections.filter(s=>s.name.includes('fast')&&s.size>0).forEach(sec=>{
-        diag.push(`[FAST] section ${sec.name} size=${sec.size} @file-offset=0x${sec.offset.toString(16)}`);
-        const matches=[];
+        diag.push(`[FAST] section ${sec.name} size=${sec.size}B @0x${sec.offset.toString(16)}`);
+        let matchCount=0;
+        const MAX_MATCH_LOG=10;
         for(let i=0;i<=sec.size-4;i++){
           const val=dv.getUint32(sec.offset+i,true);
           const name=SDK_HASHMAP[val];
-          if(name){
-            const next8=Array.from(u8all.slice(sec.offset+i+4,sec.offset+i+12)).map(b=>b.toString(16).padStart(2,'0')).join(' ');
-            matches.push(`pos ${i}: ${name} (0x${val.toString(16)}) next8=[${next8}]`);
-          }
+          if(name){matchCount++;if(matchCount<=MAX_MATCH_LOG)diag.push(`[FAST] +${i}: ${name}`);}
         }
-        diag.push(`[FAST] ${matches.length} hash matches found`);
-        matches.forEach(m=>diag.push(`[FAST] ${m}`));
-        /* Full hex dump in 32-byte chunks */
-        for(let off=0;off<sec.size;off+=32){
-          const chunk=u8all.slice(sec.offset+off,sec.offset+Math.min(off+32,sec.size));
-          const hex=Array.from(chunk).map(b=>b.toString(16).padStart(2,'0')).join(' ');
-          diag.push(`[HEX ${off.toString(16).padStart(4,'0')}] ${hex}`);
-        }
+        if(matchCount>MAX_MATCH_LOG)diag.push(`[FAST] \u2026 ${matchCount-MAX_MATCH_LOG} more matches (suppressed)`);
+        diag.push(`[FAST] ${matchCount} hash match${matchCount!==1?'es':''} found`);
       });
       setLogs(diag);
     }catch(err){setError(err.message);}};
@@ -868,6 +865,7 @@ function App(){
     try{if(ucRef.current)ucRef.current.emu_stop();}catch(e){}
     setEmuState('idle');addLog('[EMU] Stopped.');
   };
+  stopFAPRef.current=stopFAP; /* keep ref fresh so handleFile never holds a stale closure */
 
   const statusColor={idle:'#6b7280',loading:'#eab308',running:'#22c55e',error:'#ef4444',stopped:'#6b7280'}[emuState]||'#6b7280';
   const P={background:'rgba(255,255,255,0.025)',border:'1px solid rgba(255,140,0,0.1)',borderRadius:6,padding:mobile?10:14};
