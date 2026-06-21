@@ -434,9 +434,7 @@ function loadFAP(uc,fap,stubs,log){
   const u8=new Uint8Array(fap.buffer),view=new DataView(fap.buffer),le=true;
   const rs=(o,max=64)=>{let s='';for(let i=0;i<max;i++){const c=u8[o+i];if(!c)break;s+=String.fromCharCode(c);}return s;};
   const w32=(addr,val)=>{const b=new Uint8Array(4);new DataView(b.buffer).setUint32(0,val,le);uc.mem_write(addr,b);};
-  try{uc.mem_map(LOAD_BASE,4*1024*1024,7);}catch(e){log(`[MEM] LOAD_BASE map err: ${e?.message??e}`);}
-  try{uc.mem_map(RAM_BASE,1*1024*1024,6);}catch(e){log(`[MEM] RAM_BASE map err: ${e?.message??e}`);}
-  try{uc.mem_map(STUB_BASE,1*1024*1024,7);}catch(e){log(`[MEM] STUB_BASE map err: ${e?.message??e}`);}
+  uc.mem_map(LOAD_BASE,4*1024*1024,7);uc.mem_map(RAM_BASE,1*1024*1024,6);uc.mem_map(STUB_BASE,1*1024*1024,7);
   /* Peripheral space for hardware register writes (no exec) */
   try{uc.mem_map(STUB_BASE+0x100000,7*1024*1024,6);}catch(e){}  // 0x40100000-0x40800000
   try{uc.mem_map(0xE0000000,0x10000,6);}catch(e){}              // ARM system control
@@ -447,7 +445,7 @@ function loadFAP(uc,fap,stubs,log){
   const sc=new Uint8Array(1024*4);for(let i=0;i<1024;i++){sc[i*4]=0x70;sc[i*4+1]=0x47;}uc.mem_write(STUB_BASE,sc);
   const sec=n=>fap.rawSections.find(s=>s.name===n);
   const hasPhdrs=fap.phdrs&&fap.phdrs.some(p=>p.type===1);
-  let delta=0,baseVA=0;
+  let delta=0;
   if(hasPhdrs){
     /* PHDR-based loading — sections land at correct VMAs */
     log('[LOAD] Using program headers');
@@ -458,7 +456,7 @@ function loadFAP(uc,fap,stubs,log){
     }
   } else {
     /* Section-based fallback — guard against .data overwriting .text */
-    const textSec=sec('.text');baseVA=textSec?.addr??0;delta=LOAD_BASE-baseVA;
+    const textSec=sec('.text');const baseVA=textSec?.addr??0;delta=LOAD_BASE-baseVA;
     const textEnd=LOAD_BASE+(textSec?.size??0);
     const ls=s=>{
       if(!s||!s.size)return;
@@ -668,31 +666,26 @@ function App(){
     setError(null);setFap(null);setEmuState('idle');emuStateRef.current='idle';setLogs([]);
     displayRef.current.clear();renderDisplay();
     const reader=new FileReader();
-    reader.onload=e=>{try{
-      const r=parseELF(e.target.result);
-      setFap({...r,fileName:file.name});
-      const diag=[];
-      diag.push(`[ELF] type=${r.isDyn?'ET_DYN':'ET_EXEC'} entry=0x${r.eEntry.toString(16)} sections=${r.rawSections.length} phdrs=${r.phdrs?.length??0}`);
-      diag.push(`[ELF] ${r.imports.length} imports, ${Object.keys(r.definedFns||{}).length} defined SDK fns matched`);
-      /* Summarise .fast.rel.text hash matches without hex-dumping the section.
-         The previous code dumped every 32 bytes as a separate log entry then called
-         setLogs() with the full array. React rendered all entries as un-virtualised
-         divs in one synchronous paint, blocking the JS thread and freezing the UI. */
-      const dv=new DataView(r.buffer);
-      r.rawSections.filter(s=>s.name.includes('fast')&&s.size>0).forEach(sec=>{
-        diag.push(`[FAST] section ${sec.name} size=${sec.size}B @0x${sec.offset.toString(16)}`);
-        let matchCount=0;
-        const MAX_MATCH_LOG=10;
-        for(let i=0;i<=sec.size-4;i++){
-          const val=dv.getUint32(sec.offset+i,true);
-          const name=SDK_HASHMAP[val];
-          if(name){matchCount++;if(matchCount<=MAX_MATCH_LOG)diag.push(`[FAST] +${i}: ${name}`);}
-        }
-        if(matchCount>MAX_MATCH_LOG)diag.push(`[FAST] \u2026 ${matchCount-MAX_MATCH_LOG} more matches (suppressed)`);
-        diag.push(`[FAST] ${matchCount} hash match${matchCount!==1?'es':''} found`);
-      });
-      setLogs(diag);
-    }catch(err){setError(err.message);}};
+    reader.onload=e=>{
+      try{
+        const r=parseELF(e.target.result);
+        setFap({...r,fileName:file.name});
+        /* Only log a brief ELF summary here. Deep section scanning (fast.rel.text
+           hash resolution, relocation parsing) happens inside runFAP where it belongs.
+           Scanning here was running a byte-by-byte loop synchronously on the main
+           thread, and s.name.includes('fast') could match large non-fast sections
+           (e.g. .text.furi_hal_infrared_fast_push from -ffunction-sections builds),
+           blocking long enough for the browser to kill the tab. forEach also swallowed
+           the outer try/catch, so an out-of-bounds DataView read crashed React. */
+        setLogs([
+          `[ELF] ${r.isDyn?'ET_DYN':'ET_EXEC'} · entry 0x${r.eEntry.toString(16)} · ${r.rawSections.length} sections · ${r.phdrs?.length??0} phdrs`,
+          `[ELF] ${r.imports.length} import${r.imports.length!==1?'s':''} · ${Object.keys(r.definedFns||{}).length} static SDK fn${Object.keys(r.definedFns||{}).length!==1?'s':''} matched`,
+          `[ELF] .text ${r.textSize}B  .rodata ${r.rodataSize}B  .data ${r.dataSize}B  .bss ${r.bssSize}B`,
+        ]);
+      }catch(err){
+        setError(err.message);
+      }
+    };
     reader.readAsArrayBuffer(file);
   },[renderDisplay]);
 
@@ -852,14 +845,12 @@ function App(){
         }
         }else if(inputQueue.current.length>0){
           waitingInputRef.current=false;
-          try{const pc=uc.reg_read_i32(RP.PC)>>>0;
-            if(pc===0xFEFEFEFE||pc===0){addLog('[EMU] App exited while waiting for input');setEmuState('idle');emuStateRef.current='idle';if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}loopRef.current=null;return;}
-            if(pc)uc.emu_start(pc|1,0xFEFEFEFE,0,200000);renderDisplay();}catch(e){}
+          try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,200000);renderDisplay();}catch(e){}
         }
         loopRef.current=requestAnimationFrame(tick);
       };
       loopRef.current=requestAnimationFrame(tick);
-    }catch(e){if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}addLog(`[ERR] ${e?.message??String(e)}`);setEmuState('idle');emuStateRef.current='idle';}
+    }catch(e){if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}addLog(`[ERR] ${e?.message??String(e)}`);setEmuState('error');emuStateRef.current='error';}
   },[fap,ucReady,addLog,renderDisplay]);
 
   const stopFAP=()=>{
