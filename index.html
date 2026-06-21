@@ -179,6 +179,14 @@ function buildStubs(display,inputQueueRef,logFn,cb={}){const{onDraw,onWaitInput}
   reg('canvas_draw_str_aligned', (uc)=>d.str(rr(uc,1),rr(uc,2),rs(uc,spa(uc,1)),d.font));
   /* Phase 3: icon rendering */
   reg('canvas_draw_icon',        (uc)=>d.drawIcon(uc,rr(uc,1),rr(uc,2),rr(uc,3)));
+  /* canvas_draw_xbm: (canvas, x, y, w, h, bitmap*) */
+  reg('canvas_draw_xbm',        (uc)=>{
+    const x=rr(uc,1),y=rr(uc,2),w=rr(uc,3),h=spa(uc,0),ptr=spa(uc,1);
+    if(!ptr||w===0||h===0||w>128||h>64)return;
+    try{const bpr=Math.ceil(w/8),data=uc.mem_read(ptr,bpr*h);
+      for(let row=0;row<h;row++)for(let col=0;col<w;col++)
+        if(data[row*bpr+Math.floor(col/8)]&(1<<(col%8)))d.dot(x+col,y+row);}catch(e){}
+  });
   reg('canvas_draw_bitmap',      ()=>{});
   reg('canvas_get_font_params',  ()=>{});
 
@@ -362,6 +370,20 @@ function buildStubs(display,inputQueueRef,logFn,cb={}){const{onDraw,onWaitInput}
   reg('storage_file_size',()=>0); reg('storage_file_eof',()=>1);
   reg('storage_file_exists',()=>0); reg('storage_common_mkdir',()=>0);
   reg('storage_common_stat',()=>1); reg('storage_common_remove',()=>0);
+
+  /* FuriString — many apps use these; returning 0 causes NULL-deref crashes */
+  const FURI_STR_BUF=0x20009000;let furiStrNext=FURI_STR_BUF;
+  reg('furi_string_alloc',(uc)=>{const a=furiStrNext;furiStrNext+=64;try{uc.mem_write(a,new Uint8Array(64));}catch(e){}return a;});
+  reg('furi_string_alloc_set',(uc)=>{const a=furiStrNext;furiStrNext+=64;const src=rs(uc,rr(uc,0));try{const b=new Uint8Array(64);for(let i=0;i<src.length&&i<63;i++)b[i]=src.charCodeAt(i);uc.mem_write(a,b);}catch(e){}return a;});
+  reg('furi_string_free',()=>{});
+  reg('furi_string_set',(uc)=>{});  reg('furi_string_get_cstr',(uc)=>rr(uc,0));
+  reg('furi_string_cat',(uc)=>{}); reg('furi_string_cat_str',(uc)=>{});
+  reg('furi_string_reset',(uc)=>{}); reg('furi_string_size',(uc)=>0);
+  reg('furi_string_empty',(uc)=>1); reg('furi_string_cmp',(uc)=>0);
+  reg('furi_string_cmp_str',(uc)=>0); reg('furi_string_set_str',(uc)=>{});
+
+  /* Delay tick / thread yield — explicit stubs so they don't silently fall through */
+  reg('furi_delay_tick',()=>{}); reg('furi_thread_yield',()=>{});
 
   /* ARM AEABI double-precision helpers (soft-float calling convention)
      doubles passed as R0:R1 (a) and R2:R3 (b), result in R0:R1 */
@@ -735,18 +757,22 @@ function App(){
       const staticCount=Object.keys(staticFns).length;
       if(staticCount>0){
         addLog(`[EMU] Intercepting ${staticCount} SDK functions in static binary`);
+        /* Consolidated into one ranged hook to avoid Unicorn hook-count abort */
+        const staticMap={};
         for(const[name,addr]of Object.entries(staticFns)){
-          const stubAddr=stubs[name];
-          if(stubAddr===undefined)continue;
-          const handler=handlers[stubAddr];
-          if(!handler)continue;
-          uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
-            let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
+          const stubAddr=stubs[name];if(stubAddr===undefined)continue;
+          const handler=handlers[stubAddr];if(!handler)continue;
+          staticMap[addr>>>0]={name,handler};
+        }
+        if(Object.keys(staticMap).length>0){
+          uc.hook_add(window.uc.HOOK_CODE,(uc_h,hookAddr)=>{
+            const fn=staticMap[hookAddr>>>0];if(!fn)return;
+            let ret;try{ret=fn.handler(uc_h);}catch(e){ret=0;}
             if(ret!==undefined)uc_h.reg_write_i32(RP.R0,ret>>>0);
-            if(name==='canvas_commit'){commitSeen=true;renderDisplay();}
+            if(fn.name==='canvas_commit'){commitSeen=true;renderDisplay();}
             const lr=(uc_h.reg_read_i32(RP.LR)>>>0)&~1;
             uc_h.reg_write_i32(RP.PC,lr?lr:0xFEFEFEFE);
-          },addr,addr);
+          },LOAD_BASE,LOAD_BASE+4*1024*1024);
         }
       }
       const{entry,callSites}=loadFAP(uc,fap,stubs,addLog);
@@ -755,20 +781,34 @@ function App(){
         addLog(`[EMU] pre-run regs — SP=0x${preSP.toString(16)} PC=0x${prePC.toString(16)} LR=0x${preLR.toString(16)} entry=0x${entry.toString(16)}`);
       }catch(e){addLog(`[EMU] pre-run reg read err: ${e?.message??String(e)}`);}
       let callSiteHits=0;const callSiteFirstHits=[];
-      if(callSites.length>0){
+      /* Build a dispatch map instead of one hook per call site — Unicorn.js
+         has a hard limit on simultaneous HOOK_CODE hooks; 187+ individual
+         hooks reliably triggers an internal abort(). One ranged hook +
+         Map lookup is equivalent and stays well within the limit. */
+      const callSiteMap={};
+      for(const{addr,symName}of callSites){
+        const stubAddr=stubs[symName];if(stubAddr===undefined)continue;
+        const handler=handlers[stubAddr];if(!handler)continue;
+        callSiteMap[addr>>>0]={symName,handler};
+      }
+      const callSiteCount=Object.keys(callSiteMap).length;
+      if(callSiteCount>0){
         addLog(`[EMU] Hooking ${callSites.length} call sites (.rel.text + .fast.rel.text)`);
-        for(const{addr,symName}of callSites){
-          const stubAddr=stubs[symName];if(stubAddr===undefined)continue;
-          const handler=handlers[stubAddr];if(!handler)continue;
-          uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
-            callSiteHits++;
-            if(callSiteFirstHits.length<10)callSiteFirstHits.push(`${symName}@0x${addr.toString(16)}`);
-            let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
-            if(ret!==undefined)uc_h.reg_write_i32(RP.R0,ret>>>0);
-            if(symName==='canvas_commit'){commitSeen=true;renderDisplay();}
-            uc_h.reg_write_i32(RP.PC,((uc_h.reg_read_i32(RP.PC)>>>0)+4)>>>0); /* skip BL/BLX */
-          },addr,addr);
-        }
+        uc.hook_add(window.uc.HOOK_CODE,(uc_h,hookAddr)=>{
+          const site=callSiteMap[hookAddr>>>0];
+          if(!site)return;
+          callSiteHits++;
+          if(callSiteFirstHits.length<10)callSiteFirstHits.push(`${site.symName}@0x${(hookAddr>>>0).toString(16)}`);
+          let ret;try{ret=site.handler(uc_h);}catch(e){ret=0;}
+          if(ret!==undefined)uc_h.reg_write_i32(RP.R0,ret>>>0);
+          if(site.symName==='canvas_commit'){commitSeen=true;renderDisplay();}
+          /* Advance past the BL/BLX (always 4 bytes in Thumb2).
+             Use hookAddr from the callback — NOT reg_read(PC)+4.
+             reg_read(PC) returns hookAddr+4 (ARM pipeline effect), so
+             the old "+4" was actually skipping 8 bytes and landing on
+             the wrong instruction, corrupting execution. */
+          uc_h.reg_write_i32(RP.PC,(hookAddr+4)>>>0);
+        },LOAD_BASE,LOAD_BASE+4*1024*1024);
       }
       /* triggerDraw: invoke the app's registered draw callback with a fake canvas */
       const triggerDraw=()=>{
