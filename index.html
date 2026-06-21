@@ -434,7 +434,9 @@ function loadFAP(uc,fap,stubs,log){
   const u8=new Uint8Array(fap.buffer),view=new DataView(fap.buffer),le=true;
   const rs=(o,max=64)=>{let s='';for(let i=0;i<max;i++){const c=u8[o+i];if(!c)break;s+=String.fromCharCode(c);}return s;};
   const w32=(addr,val)=>{const b=new Uint8Array(4);new DataView(b.buffer).setUint32(0,val,le);uc.mem_write(addr,b);};
-  uc.mem_map(LOAD_BASE,4*1024*1024,7);uc.mem_map(RAM_BASE,1*1024*1024,6);uc.mem_map(STUB_BASE,1*1024*1024,7);
+  try{uc.mem_map(LOAD_BASE,4*1024*1024,7);}catch(e){log(`[MEM] LOAD_BASE map err: ${e?.message??e}`);}
+  try{uc.mem_map(RAM_BASE,1*1024*1024,6);}catch(e){log(`[MEM] RAM_BASE map err: ${e?.message??e}`);}
+  try{uc.mem_map(STUB_BASE,1*1024*1024,7);}catch(e){log(`[MEM] STUB_BASE map err: ${e?.message??e}`);}
   /* Peripheral space for hardware register writes (no exec) */
   try{uc.mem_map(STUB_BASE+0x100000,7*1024*1024,6);}catch(e){}  // 0x40100000-0x40800000
   try{uc.mem_map(0xE0000000,0x10000,6);}catch(e){}              // ARM system control
@@ -445,7 +447,7 @@ function loadFAP(uc,fap,stubs,log){
   const sc=new Uint8Array(1024*4);for(let i=0;i<1024;i++){sc[i*4]=0x70;sc[i*4+1]=0x47;}uc.mem_write(STUB_BASE,sc);
   const sec=n=>fap.rawSections.find(s=>s.name===n);
   const hasPhdrs=fap.phdrs&&fap.phdrs.some(p=>p.type===1);
-  let delta=0;
+  let delta=0,baseVA=0;
   if(hasPhdrs){
     /* PHDR-based loading — sections land at correct VMAs */
     log('[LOAD] Using program headers');
@@ -456,7 +458,7 @@ function loadFAP(uc,fap,stubs,log){
     }
   } else {
     /* Section-based fallback — guard against .data overwriting .text */
-    const textSec=sec('.text');const baseVA=textSec?.addr??0;delta=LOAD_BASE-baseVA;
+    const textSec=sec('.text');baseVA=textSec?.addr??0;delta=LOAD_BASE-baseVA;
     const textEnd=LOAD_BASE+(textSec?.size??0);
     const ls=s=>{
       if(!s||!s.size)return;
@@ -850,12 +852,14 @@ function App(){
         }
         }else if(inputQueue.current.length>0){
           waitingInputRef.current=false;
-          try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,200000);renderDisplay();}catch(e){}
+          try{const pc=uc.reg_read_i32(RP.PC)>>>0;
+            if(pc===0xFEFEFEFE||pc===0){addLog('[EMU] App exited while waiting for input');setEmuState('idle');emuStateRef.current='idle';if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}loopRef.current=null;return;}
+            if(pc)uc.emu_start(pc|1,0xFEFEFEFE,0,200000);renderDisplay();}catch(e){}
         }
         loopRef.current=requestAnimationFrame(tick);
       };
       loopRef.current=requestAnimationFrame(tick);
-    }catch(e){if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}addLog(`[ERR] ${e?.message??String(e)}`);setEmuState('error');emuStateRef.current='error';}
+    }catch(e){if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}addLog(`[ERR] ${e?.message??String(e)}`);setEmuState('idle');emuStateRef.current='idle';}
   },[fap,ucReady,addLog,renderDisplay]);
 
   const stopFAP=()=>{
