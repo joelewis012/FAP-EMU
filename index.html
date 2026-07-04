@@ -518,8 +518,57 @@ function loadFAP(uc,fap,stubs,log){
     }
     log(`[FAST] ${fsec.name}: resolved ${resolved} SDK call-site groups`);
   }
+
+  /* ── Inner-stub BL patching ───────────────────────────────────────────────
+     The root cause of the Unicorn.js abort() was: per-address HOOK_CODE hooks
+     at each BL call site modified PC to skip the BL. Modifying PC inside a
+     HOOK_CODE callback corrupts the TCG block-chain cache in this Unicorn.js
+     build, causing the next emu_start() to hit an internal assertion → abort().
+
+     Fix: patch every BL call site to branch to a small NOP+BX_LR trampoline
+     allocated inside the already-mapped 4 MB LOAD region (within BL's ±16 MB
+     reach). Install HOOK_CODE at each trampoline — the hook runs the handler
+     and sets R0 WITHOUT touching PC. The BL sets LR = call_site+4 naturally,
+     the trampoline's BX LR returns correctly. Zero TCG interference. */
+  const INNER_BASE = (LOAD_BASE + 0x100000) >>> 0; /* 0x8100000 — well past .text */
+  const innerStubList = [];           /* [{innerAddr, symName}] for hook install */
+  const innerStubByName = {};         /* symName → innerAddr */
+  let nextInner = INNER_BASE;
+
+  /* Pre-fill the inner stub region: NOP(0xBF00) + BX_LR(0x4770) per slot */
+  const innerRegion = new Uint8Array(0x2000); /* 8 KB = 2048 stubs */
+  for(let i = 0; i < innerRegion.length; i += 4){
+    innerRegion[i]=0x00;innerRegion[i+1]=0xBF; /* NOP   = 0xBF00 */
+    innerRegion[i+2]=0x70;innerRegion[i+3]=0x47; /* BX LR = 0x4770 */
+  }
+  try{uc.mem_write(INNER_BASE, innerRegion);}catch(e){log(`[EMU] inner-stub write err: ${e?.message}`);}
+
+  /* Thumb-2 BL encoder — returns 4 little-endian bytes */
+  const encodeBL=(from,to)=>{
+    const off=(to-(from+4))|0;           /* signed byte offset */
+    const o24=(off>>>1)&0xFFFFFF;        /* 24-bit halfword offset */
+    const S=(o24>>>23)&1, I1=(o24>>>22)&1, I2=(o24>>>21)&1;
+    const imm10=(o24>>>11)&0x3FF, imm11=o24&0x7FF;
+    const J1=(~(I1^S))&1, J2=(~(I2^S))&1;
+    const hw1=0xF000|(S<<10)|imm10, hw2=0xD000|(J1<<13)|(J2<<11)|imm11;
+    return[hw1&0xFF,(hw1>>8)&0xFF,hw2&0xFF,(hw2>>8)&0xFF];
+  };
+
+  let patchOk=0, patchFail=0;
+  for(const{addr,symName}of callSites){
+    if(innerStubByName[symName]===undefined){
+      innerStubByName[symName]=nextInner;
+      innerStubList.push({innerAddr:nextInner,symName});
+      nextInner+=4;
+    }
+    try{uc.mem_write(addr,new Uint8Array(encodeBL(addr,innerStubByName[symName])));patchOk++;}
+    catch(e){patchFail++;log(`[REL] patch fail @ 0x${addr.toString(16)}: ${e?.message}`);}
+  }
+  log(`[EMU] BL-patched ${patchOk} call sites → ${innerStubList.length} inner stubs @ 0x${INNER_BASE.toString(16)}${patchFail?` (${patchFail} failed)`:''}`);
+
   uc.reg_write_i32(RP.SP,STACK_TOP);uc.reg_write_i32(RP.LR,0xFEFEFEFE);
-  const entry=hasPhdrs?(fap.eEntry|1):((fap.eEntry+delta)|1);log(`[EMU] Entry: 0x${entry.toString(16)}`);return{entry,callSites};
+  const entry=hasPhdrs?(fap.eEntry|1):((fap.eEntry+delta)|1);log(`[EMU] Entry: 0x${entry.toString(16)}`);
+  return{entry,callSites,innerStubList,innerStubByName};
 }
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
@@ -735,7 +784,12 @@ function App(){
         const a=addr>>>0;
         if(slotReadCount<10){slotReadCount++;const pc=(uc_h.reg_read_i32(RP.PC)>>>0);addLog(`[SRD] slot read 0x${a.toString(16)} from PC=0x${pc.toString(16)}`);}
       },0x8000900,0x8000e00);}catch(e){addLog(`[SRD] hook err: ${e?.message??String(e)}`);}
-      /* Static binary: hook known SDK functions at their actual addresses */
+      /* Static binary: hook known SDK functions at their actual addresses.
+         These are entry-point hooks (PC == fn addr), not call sites, so the
+         hook fires at the first instruction of the function. We write R0 and
+         then set PC = LR (the return address the caller put in LR via BL).
+         This is safe because we are NOT modifying PC at a BL call site —
+         we are simulating a function return, which is what BX LR would do. */
       const staticFns=fap.definedFns||{};
       const staticCount=Object.keys(staticFns).length;
       if(staticCount>0){
@@ -749,30 +803,38 @@ function App(){
             let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
             if(ret!==undefined)uc_h.reg_write_i32(RP.R0,ret>>>0);
             if(name==='canvas_commit'){commitSeen=true;renderDisplay();}
+            /* Return by jumping to LR — simulates BX LR at function exit.
+               This is a function-entry hook so setting PC=LR is correct and
+               does NOT corrupt the TCG block cache (we're replacing the whole
+               function body, not splicing mid-block). */
             const lr=(uc_h.reg_read_i32(RP.LR)>>>0)&~1;
             uc_h.reg_write_i32(RP.PC,lr?lr:0xFEFEFEFE);
           },addr,addr);
         }
       }
-      const{entry,callSites}=loadFAP(uc,fap,stubs,addLog);
+      const{entry,callSites,innerStubList}=loadFAP(uc,fap,stubs,addLog);
       try{
         const preSP=(uc.reg_read_i32(RP.SP)>>>0),prePC=(uc.reg_read_i32(RP.PC)>>>0),preLR=(uc.reg_read_i32(RP.LR)>>>0);
         addLog(`[EMU] pre-run regs — SP=0x${preSP.toString(16)} PC=0x${prePC.toString(16)} LR=0x${preLR.toString(16)} entry=0x${entry.toString(16)}`);
       }catch(e){addLog(`[EMU] pre-run reg read err: ${e?.message??String(e)}`);}
+      /* Install HOOK_CODE at each inner trampoline (NOP+BX_LR at 0x8100000+).
+         The BL in .text already branches here; the hook runs the handler and
+         writes R0, then BX_LR returns to call_site+4 via the BL-set LR.
+         NO PC modification inside the hook → zero TCG corruption. */
       let callSiteHits=0;const callSiteFirstHits=[];
-      if(callSites.length>0){
-        addLog(`[EMU] Hooking ${callSites.length} call sites (.rel.text + .fast.rel.text)`);
-        for(const{addr,symName}of callSites){
+      if(innerStubList&&innerStubList.length>0){
+        addLog(`[EMU] Hooking ${callSites.length} call sites via ${innerStubList.length} inner trampolines`);
+        for(const{innerAddr,symName}of innerStubList){
           const stubAddr=stubs[symName];if(stubAddr===undefined)continue;
           const handler=handlers[stubAddr];if(!handler)continue;
           uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
             callSiteHits++;
-            if(callSiteFirstHits.length<10)callSiteFirstHits.push(`${symName}@0x${addr.toString(16)}`);
+            if(callSiteFirstHits.length<10)callSiteFirstHits.push(`${symName}@0x${innerAddr.toString(16)}`);
             let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
             if(ret!==undefined)uc_h.reg_write_i32(RP.R0,ret>>>0);
             if(symName==='canvas_commit'){commitSeen=true;renderDisplay();}
-            uc_h.reg_write_i32(RP.PC,((uc_h.reg_read_i32(RP.PC)>>>0)+4)>>>0); /* skip BL/BLX */
-          },addr,addr);
+            /* DO NOT touch PC — BX_LR in the trampoline returns correctly */
+          },innerAddr,innerAddr);
         }
       }
       /* triggerDraw: invoke the app's registered draw callback with a fake canvas */
