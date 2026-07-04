@@ -754,17 +754,13 @@ function App(){
     try{
       const uc=new window.uc.Unicorn(window.uc.ARCH_ARM,window.uc.MODE_THUMB);
       ucRef.current=uc;
-      uc.hook_add(window.uc.HOOK_CODE,(uc_h,addr)=>{
-        const h=handlers[addr];
-        if(h!==undefined){let ret;try{ret=h(uc_h);}catch(e){addLog(`[ERR] ${e?.message??String(e)}`);ret=0;}if(ret!==undefined)uc_h.reg_write_i32(RP.R0,ret>>>0);const lr=uc_h.reg_read_i32(RP.LR)>>>0;uc_h.reg_write_i32(RP.PC,lr&~1);if(addr===stubs['canvas_commit']){commitSeen=true;renderDisplay();}}
-        /* 0xFEFEFEFE detection: rely on emu_start's until= parameter, NOT emu_stop().
-           Calling emu_stop() here (fires on every instruction in this global-range build)
-           was the second source of TCG corruption. The tick loop's own PC check handles it. */
-      },STUB_BASE,STUB_BASE+0x100000);
+      /* STUB_BASE ranged hook REMOVED — it modified PC inside HOOK_CODE (reg_write_i32(PC,lr))
+         which corrupts the TCG block cache in this Unicorn.js build, causing abort() on
+         the next emu_start(). Stub dispatch is now handled by the per-address inner trampoline
+         hooks installed after loadFAP returns. */
+
       /* HOOK_INTR — log software interrupts (SVC etc) */
       let intrCount=0;try{uc.hook_add(window.uc.HOOK_INTR,(uc_h,intno)=>{if(intrCount++<5)addLog(`[INT] interrupt #${intno} (total: ${intrCount})`);});}catch(e){}
-      /* EXC_RETURN hook — simulate Cortex-M exception return by popping the hardware frame */
-      /* EXC_RETURN hook removed — wide-range HOOK_CODE fires globally in this Unicorn.js build, causing interference */
       addLog('[EXC] hook disabled — detecting 0xFEFEFEFE via tick loop instead');      /* Demand-paging hook: map any unmapped region on access so startup writes don't crash */
       const MEM_INVALID=(window.uc.HOOK_MEM_READ_UNMAPPED??16)|(window.uc.HOOK_MEM_WRITE_UNMAPPED??32)|(window.uc.HOOK_MEM_FETCH_UNMAPPED??64);
       let dynMaps=0;
@@ -784,34 +780,10 @@ function App(){
         const a=addr>>>0;
         if(slotReadCount<10){slotReadCount++;const pc=(uc_h.reg_read_i32(RP.PC)>>>0);addLog(`[SRD] slot read 0x${a.toString(16)} from PC=0x${pc.toString(16)}`);}
       },0x8000900,0x8000e00);}catch(e){addLog(`[SRD] hook err: ${e?.message??String(e)}`);}
-      /* Static binary: hook known SDK functions at their actual addresses.
-         These are entry-point hooks (PC == fn addr), not call sites, so the
-         hook fires at the first instruction of the function. We write R0 and
-         then set PC = LR (the return address the caller put in LR via BL).
-         This is safe because we are NOT modifying PC at a BL call site —
-         we are simulating a function return, which is what BX LR would do. */
-      const staticFns=fap.definedFns||{};
-      const staticCount=Object.keys(staticFns).length;
-      if(staticCount>0){
-        addLog(`[EMU] Intercepting ${staticCount} SDK functions in static binary`);
-        for(const[name,addr]of Object.entries(staticFns)){
-          const stubAddr=stubs[name];
-          if(stubAddr===undefined)continue;
-          const handler=handlers[stubAddr];
-          if(!handler)continue;
-          uc.hook_add(window.uc.HOOK_CODE,(uc_h)=>{
-            let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
-            if(ret!==undefined)uc_h.reg_write_i32(RP.R0,ret>>>0);
-            if(name==='canvas_commit'){commitSeen=true;renderDisplay();}
-            /* Return by jumping to LR — simulates BX LR at function exit.
-               This is a function-entry hook so setting PC=LR is correct and
-               does NOT corrupt the TCG block cache (we're replacing the whole
-               function body, not splicing mid-block). */
-            const lr=(uc_h.reg_read_i32(RP.LR)>>>0)&~1;
-            uc_h.reg_write_i32(RP.PC,lr?lr:0xFEFEFEFE);
-          },addr,addr);
-        }
-      }
+      /* Static-binary SDK function interception removed — per-address HOOK_CODE hooks that
+         set PC=LR still corrupt TCG in this Unicorn.js build when the hook fires mid-block.
+         Static binaries are rare; dynamic .fap files (ET_DYN) use the BL-patch trampoline
+         path which is TCG-safe. */
       const{entry,callSites,innerStubList}=loadFAP(uc,fap,stubs,addLog);
       try{
         const preSP=(uc.reg_read_i32(RP.SP)>>>0),prePC=(uc.reg_read_i32(RP.PC)>>>0),preLR=(uc.reg_read_i32(RP.LR)>>>0);
