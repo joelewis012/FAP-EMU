@@ -452,8 +452,42 @@ function loadFAP(uc,fap,stubs,log){
   const w32=(addr,val)=>{const b=new Uint8Array(4);new DataView(b.buffer).setUint32(0,val,le);uc.mem_write(addr,b);};
   uc.mem_map(LOAD_BASE,4*1024*1024,7);uc.mem_map(RAM_BASE,1*1024*1024,6);uc.mem_map(STUB_BASE,1*1024*1024,7);
   /* Peripheral space for hardware register writes (no exec) */
-  try{uc.mem_map(STUB_BASE+0x100000,7*1024*1024,6);}catch(e){}  // 0x40100000-0x40800000
-  try{uc.mem_map(0xE0000000,0x10000,6);}catch(e){}              // ARM system control
+  try{
+    uc.mem_map(STUB_BASE+0x100000,7*1024*1024,6);
+    /* Fill with 0xFF instead of leaving it zero. Newly mapped memory defaults to
+       all zeros, and a "wait for hardware ready" spin loop — while(!(REG & BIT)){} —
+       never exits against a register that's permanently zero. This binary is named
+       irblaster.fap; IR transmission commonly needs microsecond-precision timing that
+       apps get by polling raw peripheral status registers directly instead of going
+       through the SDK, which none of our JS stub functions intercept. All-1s satisfies
+       the much more common "wait until some bit is SET" pattern. Not guaranteed to fix
+       every polling pattern, but zero was guaranteed to hang against a bit-set check. */
+    const ffFill=new Uint8Array(7*1024*1024).fill(0xFF);
+    uc.mem_write(STUB_BASE+0x100000,ffFill);
+  }catch(e){}  // 0x40100000-0x40800000
+  try{
+    uc.mem_map(0xE0000000,0x10000,6);
+    const ffFill2=new Uint8Array(0x10000).fill(0xFF);
+    uc.mem_write(0xE0000000,ffFill2);
+  }catch(e){}              // ARM system control
+  /* Diagnostic: log distinct addresses read in the peripheral/system-control ranges.
+     If the guest is spinning on a specific hardware status register, this tells us
+     exactly which one — concrete evidence to fix precisely instead of guessing
+     further. Capped so a genuine tight poll loop can't flood the log. */
+  const periphReadsSeen=new Set();let periphReadCount=0;
+  try{
+    const HOOK_MEM_READ=(typeof window!=='undefined'&&window.uc?.HOOK_MEM_READ)??(typeof self!=='undefined'&&self.uc?.HOOK_MEM_READ)??1024;
+    uc.hook_add(HOOK_MEM_READ,(uc_h,_t,addr)=>{
+      const a=(addr>>>0)&~3;
+      if(!periphReadsSeen.has(a)&&periphReadsSeen.size<20){
+        periphReadsSeen.add(a);
+        const pc=(uc_h.reg_read_i32(RP.PC)>>>0);
+        log(`[PERIPH] read 0x${a.toString(16)} from PC=0x${pc.toString(16)}`);
+      }
+      periphReadCount++;
+      if(periphReadCount===2000)log('[PERIPH] 2000+ peripheral reads — likely a hardware poll loop (see addresses above)');
+    },STUB_BASE+0x100000,0xE0010000);
+  }catch(e){}
   /* Null page — unresolved calls land here and return */
   try{uc.mem_map(0,0x10000,5);const np=new Uint8Array(0x10000);for(let i=0;i<0x8000;i++){np[i*2]=0x70;np[i*2+1]=0x47;}uc.mem_write(0,np);}catch(e){}
   /* EXC_RETURN zone (0xFFFF0000) — Cortex-M exception returns land here */
@@ -635,7 +669,7 @@ function buildWorkerBlobURL(unicornURLs){
     let running=false,waitingInput=false,pendingDraw=false,needsPaint=false,commitSeen=false;
     let inputQueueArr=[],entry=0,tickTimer=null,globalInstrCount=0;
     const INSTR_CEILING=20000,BUDGET=8000;
-    function wLog(msg){ postMessage({type:'log',msg}); }
+    function wLog(msg){ postMessage({type:'log',msg:'[W] '+msg}); }
     function sendFrame(){ try{ postMessage({type:'frame',px:display.px.slice()}); }catch(e){} }
 
     function triggerDraw(){
@@ -925,7 +959,7 @@ function App(){
        freeze hits, making it LOOK like nothing happened at all. These yields let
        us see exactly how far execution gets before it locks up. */
     const paint=()=>new Promise(r=>setTimeout(r,30));
-    addLog('[EMU] Preparing…');await paint();
+    addLog('[FALLBACK-MODE] Preparing… (main-thread execution — a hang here CAN affect page responsiveness)');await paint();
     let commitSeen=false;
     watchdogRef.current=setTimeout(()=>{
       if(emuStateRef.current==='running'&&!commitSeen){
@@ -1131,7 +1165,7 @@ function App(){
     if(typeof Worker==='undefined'){addLog('[EMU] Worker API unavailable — using main-thread mode');runFAPFallback();return;}
     setEmuState('running');emuStateRef.current='running';
     setLogs([]);displayRef.current.clear();renderDisplay();
-    addLog('[EMU] Starting in a Web Worker (safe mode) — a hang here cannot freeze the page.');
+    addLog('[WORKER-MODE] Starting in a Web Worker (safe mode) — a hang here cannot freeze the page.');
     const unicornURLs=[
       new URL('unicorn.js',location.href).href,
       'https://cdn.jsdelivr.net/npm/unicorn.js/unicorn.js',
