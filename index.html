@@ -874,6 +874,7 @@ function App(){
   const[ucReady,setUcReady]  =useState(false);
   const[ucErr,setUcErr]      =useState(null);
   const[tab,setTab]          =useState('info');
+  const[crashLog,setCrashLog]=useState(null);
 
   const canvasRef   =useRef();
   const fileRef     =useRef();
@@ -894,7 +895,31 @@ function App(){
   const mobile=winW<600,tablet=winW<960;
   const scale=mobile?3:4;
 
-  const addLog=useCallback(msg=>setLogs(l=>[...l.slice(-200),msg]),[]);
+  const addLog=useCallback(msg=>setLogs(l=>{
+    const next=[...l.slice(-200),msg];
+    /* Persist synchronously to localStorage on every line. If the page later
+       freezes hard (main thread wedged, or even the worker path somehow takes
+       the main thread down with it), this survives — read it AFTER a forced
+       refresh instead of trying to read a frozen or torn-mid-render log panel,
+       which is unreliable (scroll position, partial paints, etc). */
+    try{localStorage.setItem('fapemu_lastlog',JSON.stringify(next));}catch(e){}
+    return next;
+  }),[]);
+  useEffect(()=>{
+    /* If the last session's state was still "running" when this page loaded,
+       it never got a chance to reach idle/error/stopped — meaning the previous
+       run almost certainly froze or crashed rather than exiting cleanly. Surface
+       whatever log lines were persisted right up to that point. */
+    try{
+      const lastState=localStorage.getItem('fapemu_lastState');
+      const lastLog=localStorage.getItem('fapemu_lastlog');
+      if(lastState==='running'&&lastLog){
+        const parsed=JSON.parse(lastLog);
+        if(Array.isArray(parsed)&&parsed.length>0)setCrashLog(parsed);
+      }
+    }catch(e){}
+  },[]);
+  useEffect(()=>{ try{localStorage.setItem('fapemu_lastState',emuState);}catch(e){} },[emuState]);
   const pushInput=useCallback((key,type)=>{
     if(workerModeRef.current&&workerRef.current){
       try{workerRef.current.postMessage({cmd:'input',key,type});}catch(e){}
@@ -1259,6 +1284,23 @@ function App(){
             <span style={{fontSize:9,color:statusColor,letterSpacing:'0.1em'}}>{emuState.toUpperCase()}</span>
           </div>
         </div>
+
+        {/* Persisted log from a previous session that never reached idle/error/stopped —
+            i.e. it almost certainly froze or crashed. Survives even a full page freeze
+            since it's read from localStorage on this fresh page load, not from the
+            frozen page's (possibly torn/unreadable) DOM. */}
+        {crashLog&&(
+          <div style={{background:'rgba(239,68,68,0.06)',border:'1px solid rgba(239,68,68,0.25)',borderRadius:6,padding:10,marginBottom:10}}>
+            <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:6}}>
+              <span style={{fontSize:11,color:'#f87171',fontWeight:'bold'}}>⚠ Previous session never stopped cleanly — likely froze or crashed</span>
+              <button onClick={()=>{setCrashLog(null);try{localStorage.removeItem('fapemu_lastlog');localStorage.removeItem('fapemu_lastState');}catch(e){}}}
+                style={{marginLeft:'auto',padding:'2px 8px',background:'transparent',border:'1px solid rgba(255,255,255,0.15)',color:'rgba(255,255,255,0.4)',borderRadius:3,fontSize:9,cursor:'pointer',fontFamily:'monospace'}}>DISMISS</button>
+            </div>
+            <div style={{maxHeight:180,overflowY:'auto',fontFamily:'monospace',fontSize:10,lineHeight:1.6,background:'#050805',borderRadius:4,padding:'6px 8px',color:'rgba(248,113,113,0.75)'}}>
+              {crashLog.map((l,i)=><div key={i}>{l}</div>)}
+            </div>
+          </div>
+        )}
 
         {/* Phase 3: safety banner */}
         <div style={{background:'rgba(255,140,0,0.05)',border:'1px solid rgba(255,140,0,0.15)',borderRadius:4,padding:'6px 12px',fontSize:10,color:'rgba(255,140,0,0.55)',marginBottom:10,display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
