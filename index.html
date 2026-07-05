@@ -117,7 +117,19 @@ class FlipperDisplay{
   str(x,y,text,font){
     if(!text)return;
     const sz=font==='secondary'?6:font==='keyboard'?11:font==='bignumbers'?20:8;
-    try{const tmp=document.createElement('canvas');tmp.width=Math.max(4,text.length*(sz+2));tmp.height=sz+4;const ctx=tmp.getContext('2d');ctx.font=`${sz}px monospace`;ctx.fillStyle='white';ctx.fillText(text,0,sz);const d=ctx.getImageData(0,0,tmp.width,tmp.height).data;for(let py=0;py<tmp.height;py++)for(let px=0;px<tmp.width;px++)if(d[(py*tmp.width+px)*4+3]>64)this.dot(x+px,y+py);}catch(e){}
+    try{
+      let tmp,ctx;
+      /* OffscreenCanvas works in both a normal window AND a Worker (Safari 16.4+ / iOS 16.4+).
+         Prefer it always so this exact class works unmodified in the emulation Worker. */
+      if(typeof OffscreenCanvas!=='undefined'){
+        tmp=new OffscreenCanvas(Math.max(4,text.length*(sz+2)),sz+4);ctx=tmp.getContext('2d');
+      }else{
+        tmp=document.createElement('canvas');tmp.width=Math.max(4,text.length*(sz+2));tmp.height=sz+4;ctx=tmp.getContext('2d');
+      }
+      ctx.font=`${sz}px monospace`;ctx.fillStyle='white';ctx.fillText(text,0,sz);
+      const d=ctx.getImageData(0,0,tmp.width,tmp.height).data;
+      for(let py=0;py<tmp.height;py++)for(let px=0;px<tmp.width;px++)if(d[(py*tmp.width+px)*4+3]>64)this.dot(x+px,y+py);
+    }catch(e){}
   }
   /* Phase 3: XBM icon rendering — parse Icon struct from emulator memory */
   drawIcon(uc,x,y,iconPtr){
@@ -577,7 +589,160 @@ function loadFAP(uc,fap,stubs,log){
   return{entry,callSites,innerStubList,innerStubByName};
 }
 
-/* ── Helpers ───────────────────────────────────────────────────────────── */
+/* ── Worker (Web Worker) infrastructure ───────────────────────────────────
+   Instruction-count budgets and hook-based circuit breakers had ZERO effect
+   on a confirmed freeze inside emu_start() — proof the hang is genuinely
+   stuck in native/WASM code with no JS-reachable yield point. The only way
+   to forcibly interrupt code like that is running it on a separate thread
+   we can Worker.terminate() from outside. This builds that worker's source
+   by reusing the exact same tested functions via .toString() (single source
+   of truth — no risk of hand-transcribing 400+ lines incorrectly), plus a
+   hand-written bootstrap for the message protocol and tick loop. */
+function buildWorkerBlobURL(unicornURLs){
+  const consts=`
+    const LCD_W=${LCD_W},LCD_H=${LCD_H};
+    const LOAD_BASE=${LOAD_BASE},RAM_BASE=${RAM_BASE};
+    const HEAP_BASE=${HEAP_BASE},STACK_TOP=${STACK_TOP},STUB_BASE=${STUB_BASE};
+    const RP=${JSON.stringify(RP)};
+    const CANVAS_FAKE=${CANVAS_FAKE};
+    const EM_ARM=${EM_ARM},SHN_UNDEF=${SHN_UNDEF};
+    const ALL_SDK_NAMES=${JSON.stringify(ALL_SDK_NAMES)};
+  `;
+  const shared=`
+    ${djb2.toString()}
+    const SDK_HASHMAP={};ALL_SDK_NAMES.forEach(n=>{SDK_HASHMAP[djb2(n)]=n;});
+    ${parseELF.toString()}
+    ${FlipperDisplay.toString()}
+    ${buildStubs.toString()}
+    ${loadFAP.toString()}
+  `;
+  const bootstrap=`
+    /* Some Emscripten/UMD builds hardcode "window.X = ..." with no self/globalThis
+       fallback. This alias gives such builds a "window" to write to in a Worker,
+       so 'window.uc = Module' actually lands on 'self.uc' (window===self here). */
+    if(typeof window==='undefined'){ self.window=self; }
+    let ucLoaded=false;
+    for(const url of ${JSON.stringify(unicornURLs)}){
+      try{ importScripts(url); if(self.uc){ucLoaded=true;break;} }catch(e){}
+    }
+    if(!ucLoaded||!self.uc){
+      postMessage({type:'initError',msg:'Unicorn.js failed to load inside Worker (possibly not Worker-compatible in this build)'});
+    }else{
+      postMessage({type:'ready'});
+    }
+
+    let uc=null,stubs=null,handlers=null,fapData=null,display=null;
+    let running=false,waitingInput=false,pendingDraw=false,needsPaint=false,commitSeen=false;
+    let inputQueueArr=[],entry=0,tickTimer=null,globalInstrCount=0;
+    const INSTR_CEILING=20000,BUDGET=8000;
+    function wLog(msg){ postMessage({type:'log',msg}); }
+    function sendFrame(){ try{ postMessage({type:'frame',px:display.px.slice()}); }catch(e){} }
+
+    function triggerDraw(){
+      const cb=stubs._getVPDraw?.(),ctx=stubs._getVPCtx?.();
+      if(!cb)return;
+      const saved=[RP.R0,RP.R1,RP.R2,RP.R3,RP.LR,RP.PC,RP.SP].map(r=>[r,uc.reg_read_i32(r)>>>0]);
+      uc.reg_write_i32(RP.R0,CANVAS_FAKE);uc.reg_write_i32(RP.R1,(ctx||0)>>>0);uc.reg_write_i32(RP.LR,0xFEFEFEFE);
+      wLog(\`[DRAW] calling draw_cb @ 0x\${cb.toString(16)}\`);
+      try{globalInstrCount=0;uc.emu_start((cb|1)>>>0,0xFEFEFEFE,0,15000);commitSeen=true;needsPaint=false;sendFrame();}catch(e){wLog(\`[DRAW] err: \${e?.message??String(e)}\`);}
+      saved.forEach(([r,v])=>{try{uc.reg_write_i32(r,v);}catch(e){}});
+    }
+
+    function stopTick(reason){
+      running=false;
+      if(tickTimer){clearInterval(tickTimer);tickTimer=null;}
+      postMessage({type:'stopped',reason});
+    }
+
+    function tick(){
+      if(!running)return;
+      if(pendingDraw){pendingDraw=false;try{triggerDraw();}catch(e){wLog(\`[ERR] triggerDraw: \${e?.message??String(e)}\`);}}
+      if(!waitingInput){
+        try{
+          const pc=uc.reg_read_i32(RP.PC)>>>0;
+          if(pc===0xFEFEFEFE||pc===0){wLog(\`[EMU] App returned to 0x\${pc.toString(16)} — stopped\`);stopTick('returned');return;}
+          globalInstrCount=0;
+          uc.emu_start(pc|1,0xFEFEFEFE,0,BUDGET);
+          const pcAfter=uc.reg_read_i32(RP.PC)>>>0;
+          if(pcAfter===0xFEFEFEFE){wLog('[EMU] App returned normally');stopTick('returned');return;}
+          if(needsPaint){needsPaint=false;sendFrame();}
+        }catch(e){wLog(\`[ERR] tick: \${e?.message??String(e)}\`);stopTick('error');return;}
+      }else if(inputQueueArr.length>0){
+        waitingInput=false;
+        try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE){globalInstrCount=0;uc.emu_start(pc|1,0xFEFEFEFE,0,BUDGET);}needsPaint=false;sendFrame();}catch(e){}
+      }
+    }
+
+    self.onmessage=function(e){
+      const msg=e.data;
+      if(msg.cmd==='load'){
+        try{
+          fapData=parseELF(msg.buffer);
+          display=new FlipperDisplay();
+          const inputRef={current:inputQueueArr};
+          const built=buildStubs(display,inputRef,wLog,{
+            onDraw:()=>{pendingDraw=true;},
+            onWaitInput:()=>{waitingInput=true;pendingDraw=true;}
+          });
+          stubs=built.stubs;handlers=built.handlers;
+          uc=new self.uc.Unicorn(self.uc.ARCH_ARM,self.uc.MODE_THUMB);
+          const loaded=loadFAP(uc,fapData,stubs,wLog);
+          entry=loaded.entry;
+          const{callSites,innerStubList}=loaded;
+          let callSiteHits=0;const callSiteFirstHits=[];
+          if(innerStubList&&innerStubList.length>0){
+            wLog(\`[EMU] Hooking \${callSites.length} call sites via \${innerStubList.length} inner trampolines\`);
+            for(const{innerAddr,symName}of innerStubList){
+              const stubAddr=stubs[symName];if(stubAddr===undefined)continue;
+              const handler=handlers[stubAddr];if(!handler)continue;
+              uc.hook_add(self.uc.HOOK_CODE,(uc_h)=>{
+                callSiteHits++;
+                if(callSiteFirstHits.length<10)callSiteFirstHits.push(\`\${symName}@0x\${innerAddr.toString(16)}\`);
+                let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
+                if(ret!==undefined)uc_h.reg_write_i32(RP.R0,ret>>>0);
+                if(symName==='canvas_commit'){commitSeen=true;needsPaint=true;}
+              },innerAddr,innerAddr);
+            }
+          }
+          try{
+            uc.hook_add(self.uc.HOOK_CODE,()=>{
+              if(++globalInstrCount>INSTR_CEILING){
+                throw new Error(\`Instruction ceiling (\${INSTR_CEILING}) exceeded — likely infinite loop (last hits: \${callSiteFirstHits.join(', ')})\`);
+              }
+            },LOAD_BASE,LOAD_BASE+4*1024*1024);
+          }catch(e){wLog(\`[EMU] circuit-breaker install err: \${e?.message??String(e)}\`);}
+          const MEM_INVALID=(self.uc.HOOK_MEM_READ_UNMAPPED??16)|(self.uc.HOOK_MEM_WRITE_UNMAPPED??32)|(self.uc.HOOK_MEM_FETCH_UNMAPPED??64);
+          let dynMaps=0;const DYN_MAP_CAP=8;
+          const fillStub=new Uint8Array(0x10000);{const u16=new Uint16Array(fillStub.buffer);u16.fill(0x4770);}
+          try{uc.hook_add(MEM_INVALID,(uc_h,_type,addr)=>{
+            if(dynMaps>=DYN_MAP_CAP){if(dynMaps===DYN_MAP_CAP){wLog(\`[MEM] dyn-map cap (\${DYN_MAP_CAP}) reached\`);dynMaps++;}return false;}
+            const page=((addr>>>0)&0xFFFF0000)>>>0;
+            try{uc_h.mem_map(page,0x10000,7);uc_h.mem_write(page,fillStub);}catch(e){}
+            if(dynMaps<16)wLog(\`[MEM] dyn-map 64KB @ 0x\${page.toString(16)}\`);
+            dynMaps++;return true;
+          },1,0xFFFFFFFF);}catch(e){wLog(\`[MEM] hook unavailable: \${e?.message??String(e)}\`);}
+          postMessage({type:'loaded',entry});
+        }catch(err){postMessage({type:'error',msg:err?.message??String(err)});}
+      }else if(msg.cmd==='run'){
+        running=true;
+        wLog(\`[EMU] Calling emu_start (init run, budget=\${BUDGET})…\`);
+        try{globalInstrCount=0;uc.emu_start(entry,0xFEFEFEFE,0,BUDGET);}catch(e){postMessage({type:'error',msg:'init: '+(e?.message??String(e))});running=false;return;}
+        wLog('[EMU] emu_start (init run) returned');
+        sendFrame();
+        tickTimer=setInterval(tick,16);
+      }else if(msg.cmd==='input'){
+        inputQueueArr.push({key:msg.key,type:msg.type});
+      }else if(msg.cmd==='stop'){
+        stopTick('user');
+      }
+    };
+  `;
+  const src=consts+shared+bootstrap;
+  const blob=new Blob([src],{type:'application/javascript'});
+  return URL.createObjectURL(blob);
+}
+
+
 function useWindowWidth(){const[w,setW]=useState(window.innerWidth);useEffect(()=>{const h=()=>setW(window.innerWidth);window.addEventListener('resize',h);return()=>window.removeEventListener('resize',h);},[]);return w;}
 
 /* ── Components ────────────────────────────────────────────────────────── */
@@ -687,14 +852,28 @@ function App(){
   const pendingDrawRef=useRef(false);
   const waitingInputRef=useRef(false);
   const needsPaintRef=useRef(false); /* set by canvas_commit hits; drained once per frame */
+  const workerRef=useRef(null);
+  const hardWatchdogRef=useRef(null); /* forcibly terminates the worker if it goes silent */
+  const workerModeRef=useRef(false); /* true once we know Worker execution is active for this run */
 
   const winW=useWindowWidth();
   const mobile=winW<600,tablet=winW<960;
   const scale=mobile?3:4;
 
   const addLog=useCallback(msg=>setLogs(l=>[...l.slice(-200),msg]),[]);
+  const pushInput=useCallback((key,type)=>{
+    if(workerModeRef.current&&workerRef.current){
+      try{workerRef.current.postMessage({cmd:'input',key,type});}catch(e){}
+    }else{
+      inputQueue.current.push({key,type});
+    }
+  },[]);
   const renderDisplay=useCallback(()=>{if(canvasRef.current)displayRef.current.render(canvasRef.current,scale);},[scale]);
   useEffect(()=>renderDisplay(),[renderDisplay]);
+  useEffect(()=>()=>{ /* unmount cleanup */
+    if(hardWatchdogRef.current)clearTimeout(hardWatchdogRef.current);
+    if(workerRef.current){try{workerRef.current.terminate();}catch(e){}}
+  },[]);
 
   /* Load Unicorn.js */
   useEffect(()=>{
@@ -705,11 +884,11 @@ function App(){
 
   /* Keyboard */
   useEffect(()=>{
-    const dn=e=>{const k=KEY_MAP[e.key];if(k!==undefined){e.preventDefault();inputQueue.current.push({key:k,type:InputType.Press});}};
-    const up=e=>{const k=KEY_MAP[e.key];if(k!==undefined)inputQueue.current.push({key:k,type:InputType.Release});};
+    const dn=e=>{const k=KEY_MAP[e.key];if(k!==undefined){e.preventDefault();pushInput(k,InputType.Press);}};
+    const up=e=>{const k=KEY_MAP[e.key];if(k!==undefined)pushInput(k,InputType.Release);};
     window.addEventListener('keydown',dn);window.addEventListener('keyup',up);
     return()=>{window.removeEventListener('keydown',dn);window.removeEventListener('keyup',up);};
-  },[]);
+  },[pushInput]);
 
   const handleFile=useCallback(file=>{
     if(!file)return;
@@ -731,7 +910,7 @@ function App(){
     reader.readAsArrayBuffer(file);
   },[renderDisplay]);
 
-  const runFAP=useCallback(async()=>{
+  const runFAPFallback=useCallback(async()=>{
     if(!fap||!ucReady||!window.uc){addLog('[ERR] Unicorn.js not ready');return;}
     if(fap.imports.length===0){
       addLog('[ERR] No stubbable imports found — cannot emulate this binary.');
@@ -924,10 +1103,106 @@ function App(){
     }catch(e){if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}addLog(`[ERR] ${e?.message??String(e)}`);setEmuState('error');emuStateRef.current='error';}
   },[fap,ucReady,addLog,renderDisplay]);
 
+  /* ── Worker-based execution (primary path) ────────────────────────────────
+     Runs the entire Unicorn engine + hooks on a separate thread so a genuine
+     native/WASM hang can be forcibly killed with worker.terminate() without
+     ever blocking the main thread — the page stays responsive no matter what
+     happens inside the emulator. Falls back to the main-thread path above if
+     the Worker can't load unicorn.js (e.g. it hardcodes `window` with no
+     self/globalThis fallback, which a Worker doesn't have). */
+  const WORKER_SILENCE_TIMEOUT_MS=8000;
+  const cleanupWorker=useCallback(()=>{
+    if(hardWatchdogRef.current){clearTimeout(hardWatchdogRef.current);hardWatchdogRef.current=null;}
+    if(workerRef.current){try{workerRef.current.terminate();}catch(e){}workerRef.current=null;}
+    workerModeRef.current=false;
+  },[]);
+
+  const armHardWatchdog=useCallback(()=>{
+    if(hardWatchdogRef.current)clearTimeout(hardWatchdogRef.current);
+    hardWatchdogRef.current=setTimeout(()=>{
+      addLog(`[EMU] Worker silent for ${WORKER_SILENCE_TIMEOUT_MS/1000}s — forcibly terminating (this is the safety net; the page itself never froze).`);
+      cleanupWorker();
+      setEmuState('idle');emuStateRef.current='idle';
+    },WORKER_SILENCE_TIMEOUT_MS);
+  },[addLog,cleanupWorker]);
+
+  const runFAP=useCallback(()=>{
+    if(!fap){addLog('[ERR] No .fap loaded');return;}
+    if(typeof Worker==='undefined'){addLog('[EMU] Worker API unavailable — using main-thread mode');runFAPFallback();return;}
+    setEmuState('running');emuStateRef.current='running';
+    setLogs([]);displayRef.current.clear();renderDisplay();
+    addLog('[EMU] Starting in a Web Worker (safe mode) — a hang here cannot freeze the page.');
+    const unicornURLs=[
+      new URL('unicorn.js',location.href).href,
+      'https://cdn.jsdelivr.net/npm/unicorn.js/unicorn.js',
+      'https://unpkg.com/unicorn.js/unicorn.js',
+    ];
+    let workerFailed=false;
+    let worker;
+    try{
+      const blobUrl=buildWorkerBlobURL(unicornURLs);
+      worker=new Worker(blobUrl);
+    }catch(e){
+      addLog(`[EMU] Worker creation failed: ${e?.message??String(e)} — falling back to main-thread mode`);
+      runFAPFallback();return;
+    }
+    workerRef.current=worker;workerModeRef.current=true;
+    armHardWatchdog();
+    worker.onerror=(e)=>{
+      if(workerFailed)return;workerFailed=true;
+      addLog(`[EMU] Worker error: ${e?.message??'unknown'} — falling back to main-thread mode`);
+      cleanupWorker();
+      runFAPFallback();
+    };
+    worker.onmessage=(e)=>{
+      const msg=e.data;
+      armHardWatchdog(); /* any message = still alive, extend the deadline */
+      switch(msg.type){
+        case'ready':{
+          try{
+            const bufCopy=fap.buffer.slice(0); /* copy since postMessage transfer detaches it */
+            worker.postMessage({cmd:'load',buffer:bufCopy},[bufCopy]);
+          }catch(err){addLog(`[EMU] Failed to send file to worker: ${err?.message??String(err)}`);}
+          break;
+        }
+        case'initError':
+          if(workerFailed)break;workerFailed=true;
+          addLog(`[EMU] ${msg.msg} — falling back to main-thread mode`);
+          cleanupWorker();
+          runFAPFallback();
+          break;
+        case'loaded':
+          worker.postMessage({cmd:'run'});
+          break;
+        case'log':
+          addLog(msg.msg);
+          break;
+        case'frame':
+          if(msg.px){displayRef.current.px.set(msg.px);renderDisplay();}
+          break;
+        case'error':
+          addLog(`[ERR] ${msg.msg}`);
+          cleanupWorker();
+          setEmuState('idle');emuStateRef.current='idle';
+          break;
+        case'stopped':
+          cleanupWorker();
+          setEmuState('idle');emuStateRef.current='idle';
+          break;
+      }
+    };
+  },[fap,addLog,renderDisplay,runFAPFallback,armHardWatchdog,cleanupWorker]);
+
   const stopFAP=()=>{
     emuStateRef.current='stopped';
     if(loopRef.current)cancelAnimationFrame(loopRef.current);
     if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}
+    if(workerModeRef.current&&workerRef.current){
+      try{workerRef.current.postMessage({cmd:'stop'});}catch(e){}
+      /* postMessage is a best-effort graceful stop; terminate() is the real guarantee
+         in case the worker is genuinely stuck and never processes that message. */
+      cleanupWorker();
+    }
     try{if(ucRef.current)ucRef.current.emu_stop();}catch(e){}
     setEmuState('idle');addLog('[EMU] Stopped.');
   };
@@ -996,7 +1271,7 @@ function App(){
                 <div style={P}><FlipperScreen canvasRef={canvasRef} scale={scale} onZoom={()=>setZoomed(true)}/></div>
                 <div style={P}>
                   <div style={PT}>CONTROLS · ARROWS / ENTER / ESC</div>
-                  <DPad onInput={(key,type)=>{inputQueue.current.push({key,type});if(emuState!=='running')addLog(`[INPUT] ${Object.keys(InputKey)[key]} ${type===0?'↓':'↑'}`);}}/>
+                  <DPad onInput={(key,type)=>{pushInput(key,type);if(emuState!=='running')addLog(`[INPUT] ${Object.keys(InputKey)[key]} ${type===0?'↓':'↑'}`);}}/>
                 </div>
               </div>
 
