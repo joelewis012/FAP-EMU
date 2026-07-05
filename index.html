@@ -850,6 +850,24 @@ function App(){
           },innerAddr,innerAddr);
         }
       }
+      /* SAFETY CIRCUIT BREAKER: shrinking emu_start's count parameter from 500,000
+         down to 8,000 had ZERO effect on the hang — it froze identically every time.
+         That insensitivity to budget size is the signature of TCG block-chaining:
+         if a tight loop compiles into a single translated block, this engine can
+         re-execute that block repeatedly without ever re-checking the JS-visible
+         instruction counter, making `count` effectively unenforced for that loop.
+         A WIDE-RANGE HOOK_CODE hook is already known (see comments elsewhere in this
+         file) to force this particular Unicorn.js build to fire on every single
+         instruction — which defeats chaining. We use that here purely to count and
+         forcibly throw past a hard ceiling, independent of whatever `count` does. */
+      let globalInstrCount=0;const INSTR_CEILING=20000;
+      try{
+        uc.hook_add(window.uc.HOOK_CODE,()=>{
+          if(++globalInstrCount>INSTR_CEILING){
+            throw new Error(`Instruction ceiling (${INSTR_CEILING}) exceeded — likely infinite loop in guest code (last hits: ${callSiteFirstHits.join(', ')})`);
+          }
+        },LOAD_BASE,LOAD_BASE+4*1024*1024);
+      }catch(e){addLog(`[EMU] circuit-breaker hook install err: ${e?.message??String(e)}`);}
       /* triggerDraw: invoke the app's registered draw callback with a fake canvas */
       const triggerDraw=()=>{
         const cb=stubs._getVPDraw?.(),ctx=stubs._getVPCtx?.();
@@ -857,7 +875,7 @@ function App(){
         const saved=[RP.R0,RP.R1,RP.R2,RP.R3,RP.LR,RP.PC,RP.SP].map(r=>[r,uc.reg_read_i32(r)>>>0]);
         uc.reg_write_i32(RP.R0,CANVAS_FAKE);uc.reg_write_i32(RP.R1,(ctx||0)>>>0);uc.reg_write_i32(RP.LR,0xFEFEFEFE);
         addLog(`[DRAW] calling draw_cb @ 0x${cb.toString(16)}`);
-        try{uc.emu_start((cb|1)>>>0,0xFEFEFEFE,0,15000);commitSeen=true;needsPaintRef.current=false;renderDisplay();}catch(e){addLog(`[DRAW] err: ${e?.message??String(e)}`);}
+        try{globalInstrCount=0;uc.emu_start((cb|1)>>>0,0xFEFEFEFE,0,15000);commitSeen=true;needsPaintRef.current=false;renderDisplay();}catch(e){addLog(`[DRAW] err: ${e?.message??String(e)}`);}
         saved.forEach(([r,v])=>{try{uc.reg_write_i32(r,v);}catch(e){}});
       };
       addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');await paint();
@@ -884,6 +902,7 @@ function App(){
             if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}
             loopRef.current=null;return;
           }
+          globalInstrCount=0; /* reset circuit-breaker budget for this tick's run */
           uc.emu_start(pc|1,0xFEFEFEFE,0,8000);
           /* Check if app returned after emu_start */
           const pcAfter=uc.reg_read_i32(RP.PC)>>>0;
@@ -897,7 +916,7 @@ function App(){
         }
         }else if(inputQueue.current.length>0){
           waitingInputRef.current=false;
-          try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,8000);needsPaintRef.current=false;renderDisplay();}catch(e){}
+          try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE){globalInstrCount=0;uc.emu_start(pc|1,0xFEFEFEFE,0,8000);}needsPaintRef.current=false;renderDisplay();}catch(e){}
         }
         loopRef.current=requestAnimationFrame(tick);
       };
