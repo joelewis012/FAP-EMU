@@ -140,9 +140,15 @@ class FlipperDisplay{
     }catch(e){}
   }
   render(canvas,scale){
-    canvas.width=LCD_W*scale;canvas.height=LCD_H*scale;
-    const ctx=canvas.getContext('2d'),img=ctx.createImageData(LCD_W*scale,LCD_H*scale);
-    for(let y=0;y<LCD_H;y++)for(let x=0;x<LCD_W;x++){const on=this.px[y*LCD_W+x];const[r,g,b]=on?GB_ON:GB_OFF;for(let sy=0;sy<scale;sy++)for(let sx=0;sx<scale;sx++){const i=((y*scale+sy)*(LCD_W*scale)+(x*scale+sx))*4;img.data[i]=r;img.data[i+1]=g;img.data[i+2]=b;img.data[i+3]=255;}}
+    /* Avoid resetting canvas.width/height on every call — this forces the browser
+       to fully reallocate the canvas backing store (a known-expensive "reflow trap",
+       especially costly on iOS Safari/WebKit). Only touch it when scale actually changes. */
+    const w=LCD_W*scale,h=LCD_H*scale;
+    if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;this._img=null;}
+    const ctx=canvas.getContext('2d');
+    if(!this._img||this._imgCtx!==ctx)this._img=(this._imgCtx=ctx).createImageData(w,h);
+    const img=this._img,data=img.data;
+    for(let y=0;y<LCD_H;y++)for(let x=0;x<LCD_W;x++){const on=this.px[y*LCD_W+x];const[r,g,b]=on?GB_ON:GB_OFF;for(let sy=0;sy<scale;sy++)for(let sx=0;sx<scale;sx++){const i=((y*scale+sy)*w+(x*scale+sx))*4;data[i]=r;data[i+1]=g;data[i+2]=b;data[i+3]=255;}}
     ctx.putImageData(img,0,0);
   }
 }
@@ -680,6 +686,7 @@ function App(){
   const watchdogRef =useRef(null);
   const pendingDrawRef=useRef(false);
   const waitingInputRef=useRef(false);
+  const needsPaintRef=useRef(false); /* set by canvas_commit hits; drained once per frame */
 
   const winW=useWindowWidth();
   const mobile=winW<600,tablet=winW<960;
@@ -818,7 +825,14 @@ function App(){
             if(callSiteFirstHits.length<10)callSiteFirstHits.push(`${symName}@0x${innerAddr.toString(16)}`);
             let ret;try{ret=handler(uc_h);}catch(e){ret=0;}
             if(ret!==undefined)uc_h.reg_write_i32(RP.R0,ret>>>0);
-            if(symName==='canvas_commit'){commitSeen=true;renderDisplay();}
+            /* Do NOT call renderDisplay() here — canvas_commit can be hit many times
+               within a single emu_start budget (e.g. inside a real app loop). Doing a
+               full canvas resize + ImageData paint synchronously on every single hit,
+               with no yield back to the browser, is expensive DOM work that can block
+               the main thread hard enough to freeze the tab (especially on iOS Safari).
+               Instead just flag that a repaint is due; it's drained once per animation
+               frame in the tick loop below. */
+            if(symName==='canvas_commit'){commitSeen=true;needsPaintRef.current=true;}
             /* DO NOT touch PC — BX_LR in the trampoline returns correctly */
           },innerAddr,innerAddr);
         }
@@ -830,7 +844,7 @@ function App(){
         const saved=[RP.R0,RP.R1,RP.R2,RP.R3,RP.LR,RP.PC,RP.SP].map(r=>[r,uc.reg_read_i32(r)>>>0]);
         uc.reg_write_i32(RP.R0,CANVAS_FAKE);uc.reg_write_i32(RP.R1,(ctx||0)>>>0);uc.reg_write_i32(RP.LR,0xFEFEFEFE);
         addLog(`[DRAW] calling draw_cb @ 0x${cb.toString(16)}`);
-        try{uc.emu_start((cb|1)>>>0,0xFEFEFEFE,0,200000);commitSeen=true;renderDisplay();}catch(e){addLog(`[DRAW] err: ${e?.message??String(e)}`);}
+        try{uc.emu_start((cb|1)>>>0,0xFEFEFEFE,0,200000);commitSeen=true;needsPaintRef.current=false;renderDisplay();}catch(e){addLog(`[DRAW] err: ${e?.message??String(e)}`);}
         saved.forEach(([r,v])=>{try{uc.reg_write_i32(r,v);}catch(e){}});
       };
       addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
@@ -859,7 +873,7 @@ function App(){
           /* Check if app returned after emu_start */
           const pcAfter=uc.reg_read_i32(RP.PC)>>>0;
           if(pcAfter===0xFEFEFEFE){addLog('[EMU] App returned normally');setEmuState('idle');emuStateRef.current='idle';loopRef.current=null;return;}
-          renderDisplay();
+          if(needsPaintRef.current){needsPaintRef.current=false;renderDisplay();}
         }catch(e){
           addLog(`[ERR] tick: ${e?.message??String(e)}`);
           setEmuState('idle');emuStateRef.current='idle';
@@ -868,7 +882,7 @@ function App(){
         }
         }else if(inputQueue.current.length>0){
           waitingInputRef.current=false;
-          try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,50000);renderDisplay();}catch(e){}
+          try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,50000);needsPaintRef.current=false;renderDisplay();}catch(e){}
         }
         loopRef.current=requestAnimationFrame(tick);
       };
