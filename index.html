@@ -740,6 +740,13 @@ function App(){
     }
     setEmuState('running');emuStateRef.current='running';
     setLogs([]);displayRef.current.clear();renderDisplay();
+    /* Force real paints between log lines and risky work. JS is single-threaded —
+       if we log something and then immediately do heavy synchronous work with no
+       yield, React never gets a chance to flush that update to the DOM before a
+       freeze hits, making it LOOK like nothing happened at all. These yields let
+       us see exactly how far execution gets before it locks up. */
+    const paint=()=>new Promise(r=>setTimeout(r,30));
+    addLog('[EMU] Preparing…');await paint();
     let commitSeen=false;
     watchdogRef.current=setTimeout(()=>{
       if(emuStateRef.current==='running'&&!commitSeen){
@@ -758,8 +765,10 @@ function App(){
          app spins naturally until the tick's instruction budget runs out. */
       onWaitInput:()=>{waitingInputRef.current=true;pendingDrawRef.current=true;}
     });
+    addLog('[EMU] Stubs built, creating Unicorn engine…');await paint();
     try{
       const uc=new window.uc.Unicorn(window.uc.ARCH_ARM,window.uc.MODE_THUMB);
+      addLog('[EMU] Engine created, mapping memory…');await paint();
       ucRef.current=uc;
       /* STUB_BASE ranged hook REMOVED — it modified PC inside HOOK_CODE (reg_write_i32(PC,lr))
          which corrupts the TCG block cache in this Unicorn.js build, causing abort() on
@@ -778,7 +787,10 @@ function App(){
          catchable error. Capping this converts a hard freeze into a clean, fast fault
          that unwinds through our existing try/catch around emu_start. */
       const MEM_INVALID=(window.uc.HOOK_MEM_READ_UNMAPPED??16)|(window.uc.HOOK_MEM_WRITE_UNMAPPED??32)|(window.uc.HOOK_MEM_FETCH_UNMAPPED??64);
-      let dynMaps=0;const DYN_MAP_CAP=200;
+      let dynMaps=0;const DYN_MAP_CAP=8; /* was 200 — repeated incremental mem_map calls can each
+         trigger a full WASM linear-memory growth (copy-the-whole-heap) in Emscripten builds.
+         200 separate small maps risked large cumulative copy costs on memory-constrained
+         devices (iOS). 8 is enough for legitimate edge cases while bounding worst-case cost. */
       const fillStub=new Uint8Array(0x10000);
       { const u16=new Uint16Array(fillStub.buffer); u16.fill(0x4770); } /* fast fill: BX LR every halfword */
       try{uc.hook_add(MEM_INVALID,(uc_h,_type,addr)=>{
@@ -806,6 +818,7 @@ function App(){
          Static binaries are rare; dynamic .fap files (ET_DYN) use the BL-patch trampoline
          path which is TCG-safe. */
       const{entry,callSites,innerStubList}=loadFAP(uc,fap,stubs,addLog);
+      addLog('[EMU] loadFAP done (BL patching complete)');await paint();
       try{
         const preSP=(uc.reg_read_i32(RP.SP)>>>0),prePC=(uc.reg_read_i32(RP.PC)>>>0),preLR=(uc.reg_read_i32(RP.LR)>>>0);
         addLog(`[EMU] pre-run regs — SP=0x${preSP.toString(16)} PC=0x${prePC.toString(16)} LR=0x${preLR.toString(16)} entry=0x${entry.toString(16)}`);
@@ -844,14 +857,16 @@ function App(){
         const saved=[RP.R0,RP.R1,RP.R2,RP.R3,RP.LR,RP.PC,RP.SP].map(r=>[r,uc.reg_read_i32(r)>>>0]);
         uc.reg_write_i32(RP.R0,CANVAS_FAKE);uc.reg_write_i32(RP.R1,(ctx||0)>>>0);uc.reg_write_i32(RP.LR,0xFEFEFEFE);
         addLog(`[DRAW] calling draw_cb @ 0x${cb.toString(16)}`);
-        try{uc.emu_start((cb|1)>>>0,0xFEFEFEFE,0,200000);commitSeen=true;needsPaintRef.current=false;renderDisplay();}catch(e){addLog(`[DRAW] err: ${e?.message??String(e)}`);}
+        try{uc.emu_start((cb|1)>>>0,0xFEFEFEFE,0,15000);commitSeen=true;needsPaintRef.current=false;renderDisplay();}catch(e){addLog(`[DRAW] err: ${e?.message??String(e)}`);}
         saved.forEach(([r,v])=>{try{uc.reg_write_i32(r,v);}catch(e){}});
       };
-      addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');
+      addLog('[EMU] Running — user-provided binary · sandboxed · no hardware access');await paint();
       /* Run with a finite budget — NOT count=0 (unlimited). count=0 only terminated
          via emu_stop() from inside a hook, which corrupts TCG. A finite budget lets
          emu_start() return cleanly; the tick loop resumes from wherever it stopped. */
-      try{uc.emu_start(entry,0xFEFEFEFE,0,100000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
+      addLog('[EMU] Calling emu_start (init run, budget=8000)…');await paint();
+      try{uc.emu_start(entry,0xFEFEFEFE,0,8000);}catch(e){addLog(`[EMU] init error: ${e?.message??String(e)}`);}
+      addLog('[EMU] emu_start (init run) returned');
       try{
         const finalPC=(uc.reg_read_i32(RP.PC)>>>0),finalSP=(uc.reg_read_i32(RP.SP)>>>0);
         addLog(`[EMU] init done — PC=0x${finalPC.toString(16)} SP=0x${finalSP.toString(16)} callSiteHits=${callSiteHits} [${callSiteFirstHits.join(', ')}] commitSeen=${commitSeen} pendingDraw=${pendingDrawRef.current}`);
@@ -869,7 +884,7 @@ function App(){
             if(watchdogRef.current){clearTimeout(watchdogRef.current);watchdogRef.current=null;}
             loopRef.current=null;return;
           }
-          uc.emu_start(pc|1,0xFEFEFEFE,0,50000);
+          uc.emu_start(pc|1,0xFEFEFEFE,0,8000);
           /* Check if app returned after emu_start */
           const pcAfter=uc.reg_read_i32(RP.PC)>>>0;
           if(pcAfter===0xFEFEFEFE){addLog('[EMU] App returned normally');setEmuState('idle');emuStateRef.current='idle';loopRef.current=null;return;}
@@ -882,7 +897,7 @@ function App(){
         }
         }else if(inputQueue.current.length>0){
           waitingInputRef.current=false;
-          try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,50000);needsPaintRef.current=false;renderDisplay();}catch(e){}
+          try{const pc=uc.reg_read_i32(RP.PC)>>>0;if(pc&&pc!==0xFEFEFEFE)uc.emu_start(pc|1,0xFEFEFEFE,0,8000);needsPaintRef.current=false;renderDisplay();}catch(e){}
         }
         loopRef.current=requestAnimationFrame(tick);
       };
